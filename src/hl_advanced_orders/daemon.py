@@ -2,10 +2,12 @@ from __future__ import annotations
 
 from typing import Protocol
 
-from .audit import AuditEvent, JsonlAuditLog
+from .audit import JsonlAuditLog
 from .hyperliquid_client import FillEvent, PositionSnapshot
-from .models import ExecutionMode, PositionSide, PriceTick, RuleStatus, TriggeredExit
+from .models import PositionSide, PriceTick, RuleStatus, TriggeredExit
+from .readiness import ReadinessContext
 from .storage import LocalDaemonState, LocalStateStore
+from .submission import SubmissionPolicy
 from .trailing import TrailingStopEngine, TrailingStopState
 
 
@@ -31,12 +33,16 @@ class DaemonService:
         market_data: MarketDataGateway,
         account: AccountGateway,
         engine: TrailingStopEngine | None = None,
+        submission_policy: SubmissionPolicy | None = None,
+        readiness_context: ReadinessContext | None = None,
     ) -> None:
         self.store = store
         self.audit = audit
         self.market_data = market_data
         self.account = account
         self.engine = engine or TrailingStopEngine()
+        self.submission_policy = submission_policy or SubmissionPolicy(audit=audit)
+        self.readiness_context = readiness_context
 
     def run_once(self) -> None:
         state = self.store.load()
@@ -51,7 +57,28 @@ class DaemonService:
             tick = self.market_data.get_mark_price(rule.coin)
             triggered = self.engine.observe(runtime, tick)
             if triggered is not None:
-                self._handle_triggered_exit(triggered, state)
+                context = self.readiness_context
+                if context is not None:
+                    context = ReadinessContext(
+                        account=context.account,
+                        market_exists=context.market_exists,
+                        observed_live_mark_price=context.observed_live_mark_price,
+                        kill_switch_available=context.kill_switch_available,
+                        kill_switch_active=state.kill_switch_active,
+                        dry_run_events_count=context.dry_run_events_count,
+                        confirmation_phrase=context.confirmation_phrase,
+                    )
+                elif state.kill_switch_active:
+                    context = ReadinessContext(
+                        account="",
+                        market_exists=True,
+                        observed_live_mark_price=True,
+                        kill_switch_available=True,
+                        kill_switch_active=True,
+                        dry_run_events_count=1,
+                        confirmation_phrase="",
+                    )
+                self.submission_policy.handle(triggered=triggered, rule=rule, context=context)
 
         self.store.save(state)
 
@@ -99,42 +126,3 @@ class DaemonService:
         order_id: str,
     ) -> bool:
         return fill.coin == coin and fill.side == side and fill.order_id == order_id
-
-    def _handle_triggered_exit(self, triggered: TriggeredExit, state: LocalDaemonState) -> None:
-        if triggered.execution_mode == ExecutionMode.DRY_RUN:
-            self.audit.append(
-                AuditEvent.create(
-                    "dry_run_exit",
-                    "Trailing stop would submit a reduce-only exit.",
-                    rule_id=triggered.rule_id,
-                    payload=self._trigger_payload(triggered, outcome="dry_run"),
-                )
-            )
-            return
-
-        if state.kill_switch_active:
-            self.audit.append(
-                AuditEvent.create(
-                    "live_submission_blocked",
-                    "Live submission blocked by readiness policy.",
-                    rule_id=triggered.rule_id,
-                    payload={
-                        **self._trigger_payload(triggered, outcome="blocked"),
-                        "reasons": ["kill switch is active"],
-                    },
-                )
-            )
-
-    def _trigger_payload(self, triggered: TriggeredExit, *, outcome: str) -> dict[str, str]:
-        return {
-            "rule_id": triggered.rule_id,
-            "coin": triggered.coin,
-            "side": triggered.side,
-            "size": str(triggered.size),
-            "mark_price": str(triggered.mark_price),
-            "stop_price": str(triggered.stop_price),
-            "execution_mode": triggered.execution_mode.value,
-            "exit_order_type": triggered.exit_order_type.value,
-            "reason": triggered.reason,
-            "outcome": outcome,
-        }
