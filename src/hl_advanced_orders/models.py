@@ -29,6 +29,11 @@ class ExecutionMode(StrEnum):
     AUTO_SUBMIT = "auto_submit"
 
 
+class RuleStatus(StrEnum):
+    ACTIVE = "active"
+    DISABLED = "disabled"
+
+
 @dataclass(frozen=True)
 class TrailingStopRule:
     coin: str
@@ -38,6 +43,8 @@ class TrailingStopRule:
     trail_value: Decimal
     exit_order_type: ExitOrderType = ExitOrderType.MARKET
     execution_mode: ExecutionMode = ExecutionMode.DRY_RUN
+    status: RuleStatus = RuleStatus.ACTIVE
+    attached_order_id: str | None = None
     id: str = ""
 
     def __post_init__(self) -> None:

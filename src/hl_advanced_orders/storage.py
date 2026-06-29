@@ -7,7 +7,14 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
-from .models import ExecutionMode, ExitOrderType, PositionSide, TrailMode, TrailingStopRule
+from .models import (
+    ExecutionMode,
+    ExitOrderType,
+    PositionSide,
+    RuleStatus,
+    TrailMode,
+    TrailingStopRule,
+)
 from .trailing import TrailingStopState
 
 
@@ -93,6 +100,8 @@ class LocalStateStore:
             "trail_value": str(rule.trail_value),
             "exit_order_type": rule.exit_order_type.value,
             "execution_mode": rule.execution_mode.value,
+            "status": rule.status.value,
+            "attached_order_id": rule.attached_order_id,
         }
 
     def _decode_rule(self, raw: dict[str, Any]) -> TrailingStopRule:
@@ -105,6 +114,8 @@ class LocalStateStore:
             trail_value=Decimal(str(raw["trail_value"])),
             exit_order_type=ExitOrderType(str(raw.get("exit_order_type", ExitOrderType.MARKET))),
             execution_mode=ExecutionMode(str(raw.get("execution_mode", ExecutionMode.DRY_RUN))),
+            status=RuleStatus(str(raw.get("status", RuleStatus.ACTIVE))),
+            attached_order_id=raw.get("attached_order_id"),
         )
 
     def _encode_rule_state(self, rule_id: str, state: TrailingStopState) -> dict[str, Any]:

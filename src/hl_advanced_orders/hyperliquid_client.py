@@ -25,6 +25,7 @@ class FillEvent:
     side: PositionSide
     order_id: str
     size: Decimal
+    fill_id: str | None = None
 
 
 class InfoClient(Protocol):
@@ -89,6 +90,9 @@ class HyperliquidAccountGateway:
                     side=self._fill_side(item),
                     order_id=str(item.get("oid", item.get("order_id", ""))),
                     size=Decimal(str(item.get("sz", item.get("size", "0")))),
+                    fill_id=str(item.get("hash", item.get("tid")))
+                    if item.get("hash", item.get("tid")) is not None
+                    else None,
                 )
             )
         return fills
