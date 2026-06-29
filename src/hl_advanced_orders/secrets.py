@@ -24,7 +24,10 @@ class KeychainSecrets:
         keyring.set_password(SERVICE_NAME, account, private_key)
 
     def get_private_key(self, account: str) -> str | None:
-        import keyring
+        try:
+            import keyring
+        except ImportError:
+            return None
 
         return keyring.get_password(SERVICE_NAME, account)
 
