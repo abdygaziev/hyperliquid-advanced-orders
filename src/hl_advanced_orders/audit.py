@@ -42,3 +42,30 @@ class JsonlAuditLog:
         with self.path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(asdict(event), default=str, sort_keys=True))
             handle.write("\n")
+
+    def events(self) -> list[AuditEvent]:
+        if not self.path.exists():
+            return []
+        events: list[AuditEvent] = []
+        with self.path.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                if not line.strip():
+                    continue
+                raw = json.loads(line)
+                events.append(
+                    AuditEvent(
+                        event_type=raw["event_type"],
+                        rule_id=raw.get("rule_id"),
+                        message=raw["message"],
+                        payload=raw.get("payload", {}),
+                        created_at=raw["created_at"],
+                    )
+                )
+        return events
+
+    def count_rule_events(self, rule_id: str, event_type: str) -> int:
+        return sum(
+            1
+            for event in self.events()
+            if event.rule_id == rule_id and event.event_type == event_type
+        )

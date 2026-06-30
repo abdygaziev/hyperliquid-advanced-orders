@@ -22,6 +22,7 @@ class TrailingStopState:
     stop_price: Decimal | None = None
     moving_window: deque[Decimal] = field(default_factory=deque)
     triggered: bool = False
+    processed_fill_ids: set[str] = field(default_factory=set)
 
     def increase_protected_size(self, filled_size: Decimal) -> None:
         if filled_size <= 0:
