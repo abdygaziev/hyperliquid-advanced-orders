@@ -90,6 +90,9 @@ hl-advanced-orders rule list
 hl-advanced-orders readiness rule_abc123 --account trader-main
 ```
 
+Readiness does not assume a market exists from local state alone. Pass `--market-exists` only
+after verifying the Hyperliquid market through metadata or another trusted live check.
+
 Enable or disable the kill switch:
 
 ```bash
@@ -100,7 +103,7 @@ hl-advanced-orders kill-switch --disable
 Run a bounded local daemon check:
 
 ```bash
-hl-advanced-orders run --once
+hl-advanced-orders run --once --account-address 0xabc...
 ```
 
 `auto_submit` rules are still created deliberately per rule:

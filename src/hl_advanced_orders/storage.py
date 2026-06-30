@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import os
+import tempfile
 from collections import deque
 from dataclasses import dataclass, field
 from decimal import Decimal
@@ -31,6 +33,8 @@ class LocalDaemonState:
     rule_states: dict[str, TrailingStopState] = field(default_factory=dict)
     kill_switch_active: bool = False
     last_fill_seen_by_order: dict[str, str] = field(default_factory=dict)
+    filled_size_by_order: dict[str, Decimal] = field(default_factory=dict)
+    live_mark_observed_rule_ids: set[str] = field(default_factory=set)
 
     def ensure_rule_state(self, rule: TrailingStopRule) -> TrailingStopState:
         self.rules[rule.id] = rule
@@ -55,16 +59,36 @@ class LocalStateStore:
 
     def save(self, state: LocalDaemonState) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.path.write_text(
-            json.dumps(self._encode_state(state), sort_keys=True, indent=2),
-            encoding="utf-8",
+        payload = json.dumps(self._encode_state(state), sort_keys=True, indent=2)
+        fd, temp_name = tempfile.mkstemp(
+            prefix=f".{self.path.name}.",
+            suffix=".tmp",
+            dir=self.path.parent,
+            text=True,
         )
+        temp_path = Path(temp_name)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(payload)
+                handle.flush()
+                os.fsync(handle.fileno())
+            self._replace(temp_path)
+        except Exception:
+            temp_path.unlink(missing_ok=True)
+            raise
+
+    def _replace(self, temp_path: Path) -> None:
+        temp_path.replace(self.path)
 
     def _encode_state(self, state: LocalDaemonState) -> dict[str, Any]:
         return {
             "schema_version": STATE_SCHEMA_VERSION,
             "kill_switch_active": state.kill_switch_active,
             "last_fill_seen_by_order": state.last_fill_seen_by_order,
+            "filled_size_by_order": {
+                key: str(value) for key, value in state.filled_size_by_order.items()
+            },
+            "live_mark_observed_rule_ids": sorted(state.live_mark_observed_rule_ids),
             "rules": [self._encode_rule(rule) for rule in state.rules.values()],
             "rule_states": [
                 self._encode_rule_state(rule_id, rule_state)
@@ -82,6 +106,11 @@ class LocalStateStore:
             rules=rules,
             kill_switch_active=bool(raw.get("kill_switch_active", False)),
             last_fill_seen_by_order=dict(raw.get("last_fill_seen_by_order", {})),
+            filled_size_by_order={
+                str(key): Decimal(str(value))
+                for key, value in raw.get("filled_size_by_order", {}).items()
+            },
+            live_mark_observed_rule_ids=set(raw.get("live_mark_observed_rule_ids", [])),
         )
         for item in raw.get("rule_states", []):
             rule_id, rule_state = self._decode_rule_state(item, rules)
@@ -90,7 +119,7 @@ class LocalStateStore:
             state.ensure_rule_state(rule)
         return state
 
-    def _encode_rule(self, rule: TrailingStopRule) -> dict[str, str]:
+    def _encode_rule(self, rule: TrailingStopRule) -> dict[str, str | None]:
         return {
             "id": rule.id,
             "coin": rule.coin,

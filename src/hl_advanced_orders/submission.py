@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from decimal import Decimal
+from enum import StrEnum
 from typing import Any, Protocol
 
 from .audit import AuditEvent, JsonlAuditLog
@@ -11,6 +12,13 @@ from .readiness import ReadinessChecker, ReadinessContext
 class ExchangeGateway(Protocol):
     def submit_market_close(self, coin: str, size: Decimal) -> dict[str, Any]:
         pass
+
+
+class SubmissionOutcome(StrEnum):
+    DRY_RUN_RECORDED = "dry_run_recorded"
+    LIVE_BLOCKED = "live_blocked"
+    LIVE_FAILED = "live_failed"
+    LIVE_SUBMITTED = "live_submitted"
 
 
 class SubmissionPolicy:
@@ -31,7 +39,7 @@ class SubmissionPolicy:
         triggered: TriggeredExit,
         rule: TrailingStopRule,
         context: ReadinessContext | None = None,
-    ) -> None:
+    ) -> SubmissionOutcome:
         if triggered.execution_mode == ExecutionMode.DRY_RUN:
             self.audit.append(
                 AuditEvent.create(
@@ -41,7 +49,7 @@ class SubmissionPolicy:
                     payload=trigger_payload(triggered, outcome="dry_run"),
                 )
             )
-            return
+            return SubmissionOutcome.DRY_RUN_RECORDED
 
         reasons = self._blocked_reasons(rule, context)
         if reasons:
@@ -53,7 +61,7 @@ class SubmissionPolicy:
                     payload={**trigger_payload(triggered, outcome="blocked"), "reasons": reasons},
                 )
             )
-            return
+            return SubmissionOutcome.LIVE_BLOCKED
 
         assert self.exchange is not None
         try:
@@ -67,7 +75,7 @@ class SubmissionPolicy:
                     payload={**trigger_payload(triggered, outcome="failed"), "error": str(exc)},
                 )
             )
-            return
+            return SubmissionOutcome.LIVE_FAILED
 
         self.audit.append(
             AuditEvent.create(
@@ -80,6 +88,7 @@ class SubmissionPolicy:
                 },
             )
         )
+        return SubmissionOutcome.LIVE_SUBMITTED
 
     def _blocked_reasons(
         self,

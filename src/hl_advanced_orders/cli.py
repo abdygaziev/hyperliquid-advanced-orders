@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
@@ -9,6 +10,8 @@ import typer
 
 from . import __version__
 from .audit import AuditEvent, JsonlAuditLog
+from .daemon import DaemonService
+from .hyperliquid_client import HyperliquidAccountGateway, HyperliquidMarketDataGateway
 from .models import ExecutionMode, PositionSide, RuleStatus, TrailMode, TrailingStopRule
 from .readiness import ReadinessChecker, ReadinessContext
 from .secrets import KeychainSecrets
@@ -71,10 +74,25 @@ def init(ctx: typer.Context) -> None:
 def run(
     ctx: typer.Context,
     once: bool = typer.Option(False, "--once", help="Run one bounded daemon tick."),
+    account_address: str | None = typer.Option(
+        None,
+        "--account-address",
+        help="Hyperliquid wallet address for account state and fills.",
+    ),
+    base_url: str | None = typer.Option(None, "--base-url", help="Optional Hyperliquid API URL."),
 ) -> None:
-    state = state_store(ctx).load()
     if once:
-        typer.echo(f"Ready for one daemon tick with {len(state.rules)} rule(s).")
+        if account_address is None:
+            raise typer.BadParameter("--account-address is required with --once")
+        market_data = HyperliquidMarketDataGateway(base_url=base_url)
+        account = HyperliquidAccountGateway(info=market_data.info, address=account_address)
+        DaemonService(
+            store=state_store(ctx),
+            audit=audit_log(ctx),
+            market_data=market_data,
+            account=account,
+        ).run_once()
+        typer.echo("Completed one daemon tick.")
         return
     typer.echo("Daemon loop requires live gateway configuration; use --once for a bounded check.")
 
@@ -161,18 +179,7 @@ def disable_rule(ctx: typer.Context, rule_id: str) -> None:
     store = state_store(ctx)
     state = store.load()
     rule = require_rule(state.rules, rule_id)
-    disabled = TrailingStopRule(
-        id=rule.id,
-        coin=rule.coin,
-        side=rule.side,
-        size=rule.size,
-        trail_mode=rule.trail_mode,
-        trail_value=rule.trail_value,
-        exit_order_type=rule.exit_order_type,
-        execution_mode=rule.execution_mode,
-        status=RuleStatus.DISABLED,
-        attached_order_id=rule.attached_order_id,
-    )
+    disabled = replace(rule, status=RuleStatus.DISABLED)
     state.rules[rule_id] = disabled
     state.rule_states[rule_id].rule = disabled
     store.save(state)
@@ -188,15 +195,19 @@ def readiness(
     rule_id: str,
     account: str = typer.Option(..., help="Keychain account name."),
     confirmation_phrase: str = typer.Option("", help="Mainnet auto-submit confirmation phrase."),
+    market_exists: bool = typer.Option(
+        False,
+        "--market-exists",
+        help="Set only after the market has been verified against Hyperliquid metadata.",
+    ),
 ) -> None:
     state = state_store(ctx).load()
     rule = require_rule(state.rules, rule_id)
-    runtime = state.ensure_rule_state(rule)
     checker = ReadinessChecker(KeychainSecrets())
     context = ReadinessContext(
         account=account,
-        market_exists=True,
-        observed_live_mark_price=runtime.stop_price is not None,
+        market_exists=market_exists,
+        observed_live_mark_price=rule_id in state.live_mark_observed_rule_ids,
         kill_switch_available=True,
         kill_switch_active=state.kill_switch_active,
         dry_run_events_count=count_rule_events(ctx, rule_id, "dry_run_exit"),
@@ -243,14 +254,8 @@ def kill_switch(
 @secret_app.command("store-key")
 def store_key(
     account: str = typer.Option(..., help="Keychain account name."),
-    private_key: str = typer.Option(
-        ...,
-        prompt=True,
-        hide_input=True,
-        confirmation_prompt=False,
-        help="Private key. Prompted without echo.",
-    ),
 ) -> None:
+    private_key = typer.prompt("Private key", hide_input=True, confirmation_prompt=False)
     try:
         KeychainSecrets().set_private_key(account, private_key)
     except ImportError as exc:

@@ -10,7 +10,7 @@ from hl_advanced_orders.hyperliquid_client import (
     HyperliquidMarketDataGateway,
     MissingPrivateKeyError,
 )
-from hl_advanced_orders.models import PositionSide
+from hl_advanced_orders.models import PositionSide, PriceSource
 from hl_advanced_orders.secrets import InMemorySecrets
 
 
@@ -51,13 +51,30 @@ class FakeExchange:
 
 
 class HyperliquidGatewayTest(unittest.TestCase):
-    def test_all_mids_payload_becomes_decimal_price_tick(self) -> None:
+    def test_mark_price_context_payload_becomes_decimal_price_tick(self) -> None:
+        class MarkInfo(FakeInfo):
+            def meta_and_asset_ctxs(self):
+                return (
+                    {"universe": [{"name": "ETH"}]},
+                    [{"markPx": "2451.25"}],
+                )
+
+        gateway = HyperliquidMarketDataGateway(info=MarkInfo())
+
+        tick = gateway.get_mark_price("eth")
+
+        self.assertEqual(tick.coin, "ETH")
+        self.assertEqual(tick.mark_price, Decimal("2451.25"))
+        self.assertEqual(tick.source, PriceSource.MARK)
+
+    def test_all_mids_payload_is_labeled_mid_price_fallback(self) -> None:
         gateway = HyperliquidMarketDataGateway(info=FakeInfo())
 
         tick = gateway.get_mark_price("eth")
 
         self.assertEqual(tick.coin, "ETH")
         self.assertEqual(tick.mark_price, Decimal("2450.125"))
+        self.assertEqual(tick.source, PriceSource.MID)
 
     def test_user_positions_map_positive_long_negative_short_and_skip_zero(self) -> None:
         gateway = HyperliquidAccountGateway(info=FakeInfo(), address="0xabc")

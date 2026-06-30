@@ -1,13 +1,14 @@
 from __future__ import annotations
 
+from decimal import Decimal
 from typing import Protocol
 
 from .audit import JsonlAuditLog
 from .hyperliquid_client import FillEvent, PositionSnapshot
-from .models import PositionSide, PriceTick, RuleStatus, TriggeredExit
+from .models import ExecutionMode, PositionSide, PriceSource, PriceTick, RuleStatus
 from .readiness import ReadinessContext
 from .storage import LocalDaemonState, LocalStateStore
-from .submission import SubmissionPolicy
+from .submission import SubmissionOutcome, SubmissionPolicy
 from .trailing import TrailingStopEngine, TrailingStopState
 
 
@@ -55,6 +56,8 @@ class DaemonService:
             runtime = state.ensure_rule_state(rule)
             self._update_protected_size(state, runtime, positions, fills)
             tick = self.market_data.get_mark_price(rule.coin)
+            if tick.coin == rule.coin and tick.source == PriceSource.MARK:
+                state.live_mark_observed_rule_ids.add(rule.id)
             triggered = self.engine.observe(runtime, tick)
             if triggered is not None:
                 context = self.readiness_context
@@ -62,7 +65,10 @@ class DaemonService:
                     context = ReadinessContext(
                         account=context.account,
                         market_exists=context.market_exists,
-                        observed_live_mark_price=context.observed_live_mark_price,
+                        observed_live_mark_price=(
+                            context.observed_live_mark_price
+                            or rule.id in state.live_mark_observed_rule_ids
+                        ),
                         kill_switch_available=context.kill_switch_available,
                         kill_switch_active=state.kill_switch_active,
                         dry_run_events_count=context.dry_run_events_count,
@@ -72,27 +78,19 @@ class DaemonService:
                     context = ReadinessContext(
                         account="",
                         market_exists=True,
-                        observed_live_mark_price=True,
+                        observed_live_mark_price=rule.id in state.live_mark_observed_rule_ids,
                         kill_switch_available=True,
                         kill_switch_active=True,
                         dry_run_events_count=1,
                         confirmation_phrase="",
                     )
-                self.submission_policy.handle(triggered=triggered, rule=rule, context=context)
+                if triggered.execution_mode == ExecutionMode.AUTO_SUBMIT:
+                    self.store.save(state)
+                outcome = self.submission_policy.handle(triggered=triggered, rule=rule, context=context)
+                if outcome in {SubmissionOutcome.LIVE_BLOCKED, SubmissionOutcome.LIVE_FAILED}:
+                    runtime.triggered = False
 
         self.store.save(state)
-
-    def process_tick(
-        self,
-        rule_id: str,
-        state: LocalDaemonState,
-        runtime: TrailingStopState,
-        coin: str,
-    ) -> TriggeredExit | None:
-        tick = self.market_data.get_mark_price(coin)
-        if runtime.rule.id != rule_id:
-            return None
-        return self.engine.observe(runtime, tick)
 
     def _update_protected_size(
         self,
@@ -103,20 +101,29 @@ class DaemonService:
     ) -> None:
         rule = runtime.rule
         if rule.attached_order_id:
+            order_key = f"{rule.id}:{rule.attached_order_id}"
+            total_filled = Decimal("0")
             for fill in fills:
                 if not self._fill_matches_rule(fill, rule.side, rule.coin, rule.attached_order_id):
                     continue
+                total_filled += fill.size
                 fill_key = fill.fill_id or f"{fill.order_id}:{fill.coin}:{fill.side.value}:{fill.size}"
                 if state.last_fill_seen_by_order.get(fill_key):
                     continue
                 runtime.increase_protected_size(fill.size)
                 state.last_fill_seen_by_order[fill_key] = rule.id
+            if total_filled > 0:
+                previous_total = state.filled_size_by_order.get(order_key, Decimal("0"))
+                cumulative_total = max(previous_total, total_filled)
+                runtime.protected_size = min(rule.size, cumulative_total)
+                state.filled_size_by_order[order_key] = cumulative_total
             return
 
         for position in positions:
             if position.coin == rule.coin and position.side == rule.side:
                 runtime.protected_size = min(rule.size, position.size)
                 return
+        runtime.protected_size = Decimal("0")
 
     def _fill_matches_rule(
         self,

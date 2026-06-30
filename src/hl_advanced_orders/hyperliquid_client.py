@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from decimal import Decimal
 from typing import Any, Protocol
 
-from .models import PositionSide, PriceTick
+from .models import PositionSide, PriceSource, PriceTick
 from .secrets import SecretStore
 
 
@@ -50,10 +50,41 @@ class HyperliquidMarketDataGateway:
 
     def get_mark_price(self, coin: str) -> PriceTick:
         normalized_coin = coin.upper()
+        mark_price = self._mark_price_from_asset_context(normalized_coin)
+        if mark_price is not None:
+            return PriceTick.now(normalized_coin, mark_price, source=PriceSource.MARK)
+
         mids = self.info.all_mids()
         if normalized_coin not in mids:
             raise ValueError(f"missing mark price for {normalized_coin}")
-        return PriceTick.now(normalized_coin, Decimal(str(mids[normalized_coin])))
+        return PriceTick.now(normalized_coin, Decimal(str(mids[normalized_coin])), source=PriceSource.MID)
+
+    def _mark_price_from_asset_context(self, coin: str) -> Decimal | None:
+        meta_and_contexts = getattr(self.info, "meta_and_asset_ctxs", None)
+        if meta_and_contexts is None:
+            return None
+        payload = meta_and_contexts()
+        meta, contexts = self._split_meta_and_contexts(payload)
+        universe = meta.get("universe", [])
+        for index, asset in enumerate(universe):
+            if str(asset.get("name", "")).upper() != coin:
+                continue
+            if index >= len(contexts):
+                return None
+            raw_mark = contexts[index].get("markPx")
+            return Decimal(str(raw_mark)) if raw_mark is not None else None
+        return None
+
+    def _split_meta_and_contexts(self, payload: Any) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+        if isinstance(payload, tuple | list) and len(payload) >= 2:
+            meta = payload[0] if isinstance(payload[0], dict) else {}
+            contexts = payload[1] if isinstance(payload[1], list) else []
+            return meta, contexts
+        if isinstance(payload, dict):
+            meta = payload.get("meta", payload)
+            contexts = payload.get("assetCtxs", payload.get("contexts", []))
+            return meta if isinstance(meta, dict) else {}, contexts if isinstance(contexts, list) else []
+        return {}, []
 
     def _default_info(self, base_url: str | None) -> InfoClient:
         try:

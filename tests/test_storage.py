@@ -4,6 +4,7 @@ import tempfile
 import unittest
 from decimal import Decimal
 from pathlib import Path
+from unittest.mock import patch
 
 from hl_advanced_orders.models import (
     ExecutionMode,
@@ -73,6 +74,23 @@ class LocalStateStoreTest(unittest.TestCase):
             LocalStateStore(path).save(state)
             loaded = LocalStateStore(path).load()
 
+            self.assertTrue(loaded.kill_switch_active)
+
+    def test_failed_atomic_replace_leaves_previous_state_loadable(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "state.json"
+            store = LocalStateStore(path)
+            state = store.load()
+            state.kill_switch_active = True
+            store.save(state)
+
+            next_state = store.load()
+            next_state.kill_switch_active = False
+            with patch.object(store, "_replace", side_effect=OSError("replace failed")):
+                with self.assertRaisesRegex(OSError, "replace failed"):
+                    store.save(next_state)
+
+            loaded = LocalStateStore(path).load()
             self.assertTrue(loaded.kill_switch_active)
 
 

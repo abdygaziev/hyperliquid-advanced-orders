@@ -4,6 +4,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from typer.testing import CliRunner
 
@@ -111,6 +112,7 @@ class CliWorkflowTest(unittest.TestCase):
 
         self.assertEqual(result.exit_code, 1)
         self.assertIn("missing private key in macOS Keychain", result.output)
+        self.assertIn("market does not exist: ETH", result.output)
         self.assertIn("rule has not observed live mark prices", result.output)
         self.assertIn("rule has not produced a dry-run audit event", result.output)
         self.assertIn("confirmation phrase did not match", result.output)
@@ -142,10 +144,66 @@ class CliWorkflowTest(unittest.TestCase):
         self.assertIn("kill switch is active", readiness_result.output)
 
     def test_secret_storage_does_not_echo_private_key_material(self) -> None:
-        result = self.invoke(["secret", "store-key", "--account", "trader"], "super-secret\n")
+        class FakeSecrets:
+            saved: tuple[str, str] | None = None
 
+            def set_private_key(self, account: str, private_key: str) -> None:
+                FakeSecrets.saved = (account, private_key)
+
+        with patch("hl_advanced_orders.cli.KeychainSecrets", FakeSecrets):
+            result = self.invoke(["secret", "store-key", "--account", "trader"], "super-secret\n")
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertEqual(FakeSecrets.saved, ("trader", "super-secret"))
         self.assertNotIn("super-secret", result.output)
         self.assertFalse((self.data_dir / "state.json").exists())
+
+    def test_secret_key_cannot_be_supplied_as_command_line_option(self) -> None:
+        help_result = self.invoke(["secret", "store-key", "--help"])
+        option_result = self.invoke(
+            ["secret", "store-key", "--account", "trader", "--private-key", "super-secret"]
+        )
+
+        self.assertEqual(help_result.exit_code, 0, help_result.output)
+        self.assertNotIn("--private-key", help_result.output)
+        self.assertNotEqual(option_result.exit_code, 0)
+        self.assertNotIn("super-secret", option_result.output)
+
+    def test_run_once_executes_daemon_tick_with_live_gateways(self) -> None:
+        calls: list[str] = []
+
+        class FakeMarketData:
+            info = object()
+
+            def __init__(self, base_url: str | None = None) -> None:
+                calls.append(f"market:{base_url}")
+
+        class FakeAccountGateway:
+            def __init__(self, info: object, address: str) -> None:
+                calls.append(f"account:{address}:{info is FakeMarketData.info}")
+
+        class FakeDaemon:
+            def __init__(self, **kwargs: object) -> None:
+                calls.append("daemon:init")
+
+            def run_once(self) -> None:
+                calls.append("daemon:run_once")
+
+        with (
+            patch("hl_advanced_orders.cli.HyperliquidMarketDataGateway", FakeMarketData),
+            patch("hl_advanced_orders.cli.HyperliquidAccountGateway", FakeAccountGateway),
+            patch("hl_advanced_orders.cli.DaemonService", FakeDaemon),
+        ):
+            result = self.invoke(
+                ["run", "--once", "--account-address", "0xabc", "--base-url", "http://example"]
+            )
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertIn("Completed one daemon tick.", result.output)
+        self.assertEqual(
+            calls,
+            ["market:http://example", "account:0xabc:True", "daemon:init", "daemon:run_once"],
+        )
 
 
 def read_events(path: Path) -> list[dict[str, object]]:
