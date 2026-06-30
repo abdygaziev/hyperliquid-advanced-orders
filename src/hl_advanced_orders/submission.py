@@ -1,20 +1,26 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Any
+from decimal import Decimal
+from enum import StrEnum
+from typing import Any, Protocol
 
 from .audit import AuditEvent, JsonlAuditLog
-from .hyperliquid_client import ExchangeGateway, MarketDataGateway
-from .models import ExecutionMode, TriggeredExit
+from .models import ExecutionMode, TrailingStopRule, TriggeredExit
 from .readiness import ReadinessChecker, ReadinessContext
-from .storage import RuleStoreSnapshot
+
+EXCHANGE_ERROR_STATUSES = frozenset({"error", "err", "rejected", "failed", "failure"})
 
 
-@dataclass(frozen=True)
-class SubmissionResult:
-    event: AuditEvent
-    submitted: bool = False
-    blocked: bool = False
+class ExchangeGateway(Protocol):
+    def submit_market_close(self, coin: str, size: Decimal) -> dict[str, Any]:
+        pass
+
+
+class SubmissionOutcome(StrEnum):
+    DRY_RUN_RECORDED = "dry_run_recorded"
+    LIVE_BLOCKED = "live_blocked"
+    LIVE_FAILED = "live_failed"
+    LIVE_SUBMITTED = "live_submitted"
 
 
 class SubmissionPolicy:
@@ -22,110 +28,163 @@ class SubmissionPolicy:
         self,
         *,
         audit: JsonlAuditLog,
-        readiness: ReadinessChecker,
-        market_data: MarketDataGateway,
-        exchange: ExchangeGateway | None,
-        account: str,
-        confirmation_phrase: str = "",
+        exchange: ExchangeGateway | None = None,
+        readiness_checker: ReadinessChecker | None = None,
     ) -> None:
         self.audit = audit
-        self.readiness = readiness
-        self.market_data = market_data
         self.exchange = exchange
-        self.account = account
-        self.confirmation_phrase = confirmation_phrase
+        self.readiness_checker = readiness_checker
 
-    def handle(self, exit_order: TriggeredExit, snapshot: RuleStoreSnapshot) -> SubmissionResult:
-        if exit_order.execution_mode == ExecutionMode.DRY_RUN:
-            event = self._dry_run_event(exit_order)
-            self.audit.append(event)
-            return SubmissionResult(event=event)
-
-        rule = snapshot.rules[exit_order.rule_id]
-        state = snapshot.states[exit_order.rule_id]
-        readiness = self.readiness.check_mainnet_auto_submit(
-            rule,
-            ReadinessContext(
-                account=self.account,
-                market_exists=self.market_data.market_exists(rule.coin),
-                observed_live_mark_price=state.observed_live_mark_price,
-                kill_switch_available=True,
-                kill_switch_active=snapshot.kill_switch_active,
-                dry_run_events_count=self.audit.count_rule_events(rule.id, "dry_run_triggered"),
-                confirmation_phrase=self.confirmation_phrase,
-            ),
-        )
-        if not readiness.passed:
-            event = AuditEvent.create(
-                "live_submission_blocked",
-                "Live submission blocked by readiness policy.",
-                rule_id=exit_order.rule_id,
-                payload={**_exit_payload(exit_order), "reasons": readiness.reasons},
+    def handle(
+        self,
+        *,
+        triggered: TriggeredExit,
+        rule: TrailingStopRule,
+        context: ReadinessContext | None = None,
+    ) -> SubmissionOutcome:
+        if triggered.execution_mode == ExecutionMode.DRY_RUN:
+            self.audit.append(
+                AuditEvent.create(
+                    "dry_run_exit",
+                    "Trailing stop would submit a reduce-only exit.",
+                    rule_id=triggered.rule_id,
+                    payload=trigger_payload(triggered, outcome="dry_run"),
+                )
             )
-            self.audit.append(event)
-            return SubmissionResult(event=event, blocked=True)
+            return SubmissionOutcome.DRY_RUN_RECORDED
 
-        if self.exchange is None:
-            event = AuditEvent.create(
-                "live_submission_blocked",
-                "Live submission blocked because exchange gateway is unavailable.",
-                rule_id=exit_order.rule_id,
-                payload={**_exit_payload(exit_order), "reasons": ["exchange gateway unavailable"]},
+        reasons = self._blocked_reasons(rule, context)
+        if reasons:
+            self.audit.append(
+                AuditEvent.create(
+                    "live_submission_blocked",
+                    "Live submission blocked by readiness policy.",
+                    rule_id=triggered.rule_id,
+                    payload={**trigger_payload(triggered, outcome="blocked"), "reasons": reasons},
+                )
             )
-            self.audit.append(event)
-            return SubmissionResult(event=event, blocked=True)
+            return SubmissionOutcome.LIVE_BLOCKED
+
+        assert self.exchange is not None
+        try:
+            self.audit.append(
+                AuditEvent.create(
+                    "live_submission_attempted",
+                    "Live submission attempted.",
+                    rule_id=triggered.rule_id,
+                    payload=trigger_payload(triggered, outcome="attempted"),
+                )
+            )
+            response = self.exchange.submit_market_close(triggered.coin, triggered.size)
+        except Exception as exc:
+            self.audit.append(
+                AuditEvent.create(
+                    "live_submission_failed",
+                    "Live submission failed.",
+                    rule_id=triggered.rule_id,
+                    payload={**trigger_payload(triggered, outcome="failed"), "error": str(exc)},
+                )
+            )
+            return SubmissionOutcome.LIVE_FAILED
+
+        response_error = exchange_response_error(response)
+        if response_error is not None:
+            self.audit.append(
+                AuditEvent.create(
+                    "live_submission_failed",
+                    "Live submission was rejected.",
+                    rule_id=triggered.rule_id,
+                    payload={
+                        **trigger_payload(triggered, outcome="rejected"),
+                        "error": response_error,
+                        "exchange_response": response,
+                    },
+                )
+            )
+            return SubmissionOutcome.LIVE_FAILED
 
         self.audit.append(
             AuditEvent.create(
-                "live_submission_attempted",
-                "Attempting reduce-only live exit.",
-                rule_id=exit_order.rule_id,
-                payload=_exit_payload(exit_order),
+                "live_submission_succeeded",
+                "Live submission succeeded.",
+                rule_id=triggered.rule_id,
+                payload={
+                    **trigger_payload(triggered, outcome="submitted"),
+                    "exchange_response": response,
+                },
             )
         )
-        try:
-            response = self.exchange.close_position(exit_order)
-        except Exception as exc:  # pragma: no cover - exercised with fakes in tests
-            event = AuditEvent.create(
-                "live_submission_failed",
-                "Live reduce-only exit failed.",
-                rule_id=exit_order.rule_id,
-                payload={**_exit_payload(exit_order), "error": str(exc)},
-            )
-            self.audit.append(event)
-            return SubmissionResult(event=event, blocked=True)
+        return SubmissionOutcome.LIVE_SUBMITTED
 
-        event = AuditEvent.create(
-            "live_submission_succeeded",
-            "Live reduce-only exit submitted.",
-            rule_id=exit_order.rule_id,
-            payload={**_exit_payload(exit_order), "response": _summarize(response)},
-        )
-        self.audit.append(event)
-        return SubmissionResult(event=event, submitted=True)
-
-    def _dry_run_event(self, exit_order: TriggeredExit) -> AuditEvent:
-        return AuditEvent.create(
-            "dry_run_triggered",
-            "Dry-run trailing stop triggered; no live order submitted.",
-            rule_id=exit_order.rule_id,
-            payload=_exit_payload(exit_order),
-        )
+    def _blocked_reasons(
+        self,
+        rule: TrailingStopRule,
+        context: ReadinessContext | None,
+    ) -> list[str]:
+        reasons: list[str] = []
+        if self.exchange is None:
+            reasons.append("exchange gateway is not configured")
+        if self.readiness_checker is None:
+            reasons.append("readiness checker is not configured")
+        if context is None:
+            reasons.append("readiness context is not available")
+        elif context.kill_switch_active:
+            reasons.append("kill switch is active")
+        if self.readiness_checker is not None and context is not None:
+            result = self.readiness_checker.check_mainnet_auto_submit(rule, context)
+            for reason in result.reasons:
+                if reason not in reasons:
+                    reasons.append(reason)
+        return reasons
 
 
-def _exit_payload(exit_order: TriggeredExit) -> dict[str, Any]:
+def trigger_payload(triggered: TriggeredExit, *, outcome: str) -> dict[str, Any]:
     return {
-        "rule_id": exit_order.rule_id,
-        "coin": exit_order.coin,
-        "side": exit_order.side,
-        "size": str(exit_order.size),
-        "mark_price": str(exit_order.mark_price),
-        "stop_price": str(exit_order.stop_price),
-        "execution_mode": exit_order.execution_mode.value,
-        "exit_order_type": exit_order.exit_order_type.value,
-        "outcome": exit_order.reason,
+        "rule_id": triggered.rule_id,
+        "coin": triggered.coin,
+        "side": triggered.side,
+        "size": str(triggered.size),
+        "mark_price": str(triggered.mark_price),
+        "stop_price": str(triggered.stop_price),
+        "execution_mode": triggered.execution_mode.value,
+        "exit_order_type": triggered.exit_order_type.value,
+        "reason": triggered.reason,
+        "outcome": outcome,
     }
 
 
-def _summarize(response: dict[str, Any]) -> dict[str, Any]:
-    return {key: value for key, value in response.items() if key.lower() not in {"private_key", "secret"}}
+def exchange_response_error(response: dict[str, Any]) -> str | None:
+    status = str(response.get("status", "")).lower()
+    if _is_error_status(status):
+        return str(response.get("response") or response.get("message") or status)
+
+    nested_error = _find_response_error(response)
+    if nested_error is not None:
+        return nested_error
+
+    if status and status != "ok":
+        return f"unexpected exchange status: {status}"
+    return None
+
+
+def _find_response_error(value: Any) -> str | None:
+    if isinstance(value, dict):
+        for key, item in value.items():
+            lowered = str(key).lower()
+            if lowered == "error" and item:
+                return str(item)
+            if lowered == "status" and _is_error_status(str(item).lower()):
+                return str(item)
+            nested = _find_response_error(item)
+            if nested is not None:
+                return nested
+    elif isinstance(value, list):
+        for item in value:
+            nested = _find_response_error(item)
+            if nested is not None:
+                return nested
+    return None
+
+
+def _is_error_status(status: str) -> bool:
+    return status in EXCHANGE_ERROR_STATUSES

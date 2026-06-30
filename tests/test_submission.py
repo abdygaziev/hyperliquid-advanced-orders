@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
 from decimal import Decimal
 from pathlib import Path
 
-from hl_advanced_orders.audit import AuditEvent, JsonlAuditLog
+from hl_advanced_orders.audit import JsonlAuditLog
 from hl_advanced_orders.models import (
     ExecutionMode,
     ExitOrderType,
@@ -14,131 +15,197 @@ from hl_advanced_orders.models import (
     TrailingStopRule,
     TriggeredExit,
 )
-from hl_advanced_orders.readiness import MAINNET_CONFIRMATION_PHRASE, ReadinessChecker
-from hl_advanced_orders.storage import RuleStoreSnapshot, StoredRuleState
-from hl_advanced_orders.submission import SubmissionPolicy
-
-
-class FakeSecrets:
-    def __init__(self, present: bool) -> None:
-        self.present = present
-
-    def has_private_key(self, account: str) -> bool:
-        return self.present
-
-
-class FakeMarket:
-    def __init__(self, exists: bool = True) -> None:
-        self.exists = exists
-
-    def latest_price(self, coin: str):
-        return None
-
-    def market_exists(self, coin: str) -> bool:
-        return self.exists
+from hl_advanced_orders.readiness import MAINNET_CONFIRMATION_PHRASE, ReadinessChecker, ReadinessContext
+from hl_advanced_orders.secrets import InMemorySecrets
+from hl_advanced_orders.submission import SubmissionOutcome, SubmissionPolicy
 
 
 class FakeExchange:
-    def __init__(self) -> None:
-        self.calls = 0
+    def __init__(self, *, fail: bool = False, response: dict[str, object] | None = None) -> None:
+        self.fail = fail
+        self.response = response
+        self.calls: list[tuple[str, Decimal]] = []
 
-    def close_position(self, exit_order: TriggeredExit):
-        self.calls += 1
-        return {"status": "ok"}
+    def submit_market_close(self, coin: str, size: Decimal) -> dict[str, object]:
+        self.calls.append((coin, size))
+        if self.fail:
+            raise RuntimeError("exchange unavailable")
+        if self.response is not None:
+            return self.response
+        return {"status": "ok", "coin": coin, "size": str(size)}
 
 
 class SubmissionPolicyTest(unittest.TestCase):
-    def test_dry_run_writes_audit_without_exchange_call(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            audit = JsonlAuditLog(Path(tmp) / "audit.jsonl")
+    def test_dry_run_trigger_appends_audit_and_does_not_call_exchange(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            exchange = FakeExchange()
+            policy = SubmissionPolicy(audit=JsonlAuditLog(Path(temp_dir) / "audit.jsonl"), exchange=exchange)
+
+            policy.handle(triggered=dry_run_exit(), rule=rule())
+
+            events = read_events(Path(temp_dir) / "audit.jsonl")
+            self.assertEqual(exchange.calls, [])
+            self.assertEqual(events[-1]["event_type"], "dry_run_exit")
+            self.assertEqual(events[-1]["payload"]["outcome"], "dry_run")
+
+    def test_auto_submit_blocks_each_readiness_failure_and_does_not_call_exchange(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            secrets = InMemorySecrets()
             exchange = FakeExchange()
             policy = SubmissionPolicy(
-                audit=audit,
-                readiness=ReadinessChecker(FakeSecrets(True)),
-                market_data=FakeMarket(),
+                audit=JsonlAuditLog(Path(temp_dir) / "audit.jsonl"),
                 exchange=exchange,
-                account="0xabc",
+                readiness_checker=ReadinessChecker(secrets),
+            )
+            context = ReadinessContext(
+                account="trader",
+                market_exists=False,
+                observed_live_mark_price=False,
+                kill_switch_available=True,
+                kill_switch_active=True,
+                dry_run_events_count=0,
+                confirmation_phrase="enable mainnet auto submit",
             )
 
-            policy.handle(_exit(ExecutionMode.DRY_RUN), _snapshot(ExecutionMode.DRY_RUN))
+            policy.handle(triggered=live_exit(), rule=rule(ExecutionMode.AUTO_SUBMIT), context=context)
 
-            self.assertEqual(exchange.calls, 0)
-            self.assertEqual(audit.events()[0].event_type, "dry_run_triggered")
-
-    def test_auto_submit_blocks_all_readiness_failures(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            audit = JsonlAuditLog(Path(tmp) / "audit.jsonl")
-            exchange = FakeExchange()
-            policy = SubmissionPolicy(
-                audit=audit,
-                readiness=ReadinessChecker(FakeSecrets(False)),
-                market_data=FakeMarket(False),
-                exchange=exchange,
-                account="0xabc",
-                confirmation_phrase="wrong",
-            )
-
-            result = policy.handle(_exit(ExecutionMode.AUTO_SUBMIT), _snapshot(ExecutionMode.AUTO_SUBMIT))
-
-            self.assertTrue(result.blocked)
-            self.assertEqual(exchange.calls, 0)
-            reasons = audit.events()[0].payload["reasons"]
+            events = read_events(Path(temp_dir) / "audit.jsonl")
+            self.assertEqual(exchange.calls, [])
+            reasons = events[-1]["payload"]["reasons"]
             self.assertIn("missing private key in macOS Keychain", reasons)
+            self.assertIn("market does not exist: ETH", reasons)
+            self.assertIn("rule has not observed live mark prices", reasons)
+            self.assertIn("kill switch is active", reasons)
+            self.assertIn("rule has not produced a dry-run audit event", reasons)
             self.assertIn("confirmation phrase did not match", reasons)
 
-    def test_auto_submit_calls_exchange_when_all_gates_pass(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            audit = JsonlAuditLog(Path(tmp) / "audit.jsonl")
-            audit.append(AuditEvent.create("dry_run_triggered", "prior dry run", rule_id="rule_1"))
+    def test_exact_confirmation_phrase_allows_live_submission_when_ready(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            secrets = InMemorySecrets()
+            secrets.set_private_key("trader", "private-key")
             exchange = FakeExchange()
             policy = SubmissionPolicy(
-                audit=audit,
-                readiness=ReadinessChecker(FakeSecrets(True)),
-                market_data=FakeMarket(True),
+                audit=JsonlAuditLog(Path(temp_dir) / "audit.jsonl"),
                 exchange=exchange,
-                account="0xabc",
-                confirmation_phrase=MAINNET_CONFIRMATION_PHRASE,
+                readiness_checker=ReadinessChecker(secrets),
             )
 
-            result = policy.handle(_exit(ExecutionMode.AUTO_SUBMIT), _snapshot(ExecutionMode.AUTO_SUBMIT, True))
+            policy.handle(
+                triggered=live_exit(),
+                rule=rule(ExecutionMode.AUTO_SUBMIT),
+                context=ready_context(),
+            )
 
-            self.assertTrue(result.submitted)
-            self.assertEqual(exchange.calls, 1)
-            self.assertEqual(audit.events()[-1].event_type, "live_submission_succeeded")
+            events = read_events(Path(temp_dir) / "audit.jsonl")
+            self.assertEqual(exchange.calls, [("ETH", Decimal("0.4"))])
+            self.assertEqual(events[-1]["event_type"], "live_submission_succeeded")
+            self.assertEqual(events[-1]["payload"]["exchange_response"]["status"], "ok")
+
+    def test_live_submission_failure_records_failure_audit(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            secrets = InMemorySecrets()
+            secrets.set_private_key("trader", "private-key")
+            policy = SubmissionPolicy(
+                audit=JsonlAuditLog(Path(temp_dir) / "audit.jsonl"),
+                exchange=FakeExchange(fail=True),
+                readiness_checker=ReadinessChecker(secrets),
+            )
+
+            policy.handle(
+                triggered=live_exit(),
+                rule=rule(ExecutionMode.AUTO_SUBMIT),
+                context=ready_context(),
+            )
+
+            events = read_events(Path(temp_dir) / "audit.jsonl")
+            self.assertEqual(events[-1]["event_type"], "live_submission_failed")
+            self.assertIn("exchange unavailable", events[-1]["payload"]["error"])
+
+    def test_rejected_exchange_response_records_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            secrets = InMemorySecrets()
+            secrets.set_private_key("trader", "private-key")
+            policy = SubmissionPolicy(
+                audit=JsonlAuditLog(Path(temp_dir) / "audit.jsonl"),
+                exchange=FakeExchange(
+                    response={
+                        "status": "ok",
+                        "response": {
+                            "type": "order",
+                            "data": {"statuses": [{"error": "Insufficient margin"}]},
+                        },
+                    }
+                ),
+                readiness_checker=ReadinessChecker(secrets),
+            )
+
+            outcome = policy.handle(
+                triggered=live_exit(),
+                rule=rule(ExecutionMode.AUTO_SUBMIT),
+                context=ready_context(),
+            )
+
+            events = read_events(Path(temp_dir) / "audit.jsonl")
+            self.assertEqual(outcome, SubmissionOutcome.LIVE_FAILED)
+            self.assertEqual(events[-1]["event_type"], "live_submission_failed")
+            self.assertEqual(events[-1]["payload"]["outcome"], "rejected")
+            self.assertIn("Insufficient margin", events[-1]["payload"]["error"])
 
 
-def _rule(mode: ExecutionMode) -> TrailingStopRule:
+def rule(execution_mode: ExecutionMode = ExecutionMode.DRY_RUN) -> TrailingStopRule:
     return TrailingStopRule(
-        id="rule_1",
+        id="rule_123",
         coin="ETH",
         side=PositionSide.LONG,
         size=Decimal("1"),
         trail_mode=TrailMode.ABSOLUTE,
-        trail_value=Decimal("10"),
-        execution_mode=mode,
+        trail_value=Decimal("50"),
+        execution_mode=execution_mode,
     )
 
 
-def _snapshot(mode: ExecutionMode, observed: bool = False) -> RuleStoreSnapshot:
-    rule = _rule(mode)
-    return RuleStoreSnapshot(
-        rules={rule.id: rule},
-        states={rule.id: StoredRuleState(protected_size=Decimal("1"), observed_live_mark_price=observed)},
-    )
-
-
-def _exit(mode: ExecutionMode) -> TriggeredExit:
+def dry_run_exit() -> TriggeredExit:
     return TriggeredExit(
-        rule_id="rule_1",
+        rule_id="rule_123",
         coin="ETH",
         side="sell",
-        size=Decimal("1"),
+        size=Decimal("0.4"),
         reason="trailing_stop_triggered",
-        mark_price=Decimal("90"),
-        stop_price=Decimal("95"),
-        execution_mode=mode,
+        mark_price=Decimal("95"),
+        stop_price=Decimal("100"),
+        execution_mode=ExecutionMode.DRY_RUN,
         exit_order_type=ExitOrderType.MARKET,
     )
+
+
+def live_exit() -> TriggeredExit:
+    return TriggeredExit(
+        rule_id="rule_123",
+        coin="ETH",
+        side="sell",
+        size=Decimal("0.4"),
+        reason="trailing_stop_triggered",
+        mark_price=Decimal("95"),
+        stop_price=Decimal("100"),
+        execution_mode=ExecutionMode.AUTO_SUBMIT,
+        exit_order_type=ExitOrderType.MARKET,
+    )
+
+
+def ready_context() -> ReadinessContext:
+    return ReadinessContext(
+        account="trader",
+        market_exists=True,
+        observed_live_mark_price=True,
+        kill_switch_available=True,
+        kill_switch_active=False,
+        dry_run_events_count=1,
+        confirmation_phrase=MAINNET_CONFIRMATION_PHRASE,
+    )
+
+
+def read_events(path: Path) -> list[dict[str, object]]:
+    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
 
 
 if __name__ == "__main__":

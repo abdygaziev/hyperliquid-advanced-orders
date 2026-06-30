@@ -4,60 +4,131 @@ import tempfile
 import unittest
 from decimal import Decimal
 from pathlib import Path
+from unittest.mock import patch
 
-from hl_advanced_orders.models import PositionSide, TrailMode, TrailingStopRule
-from hl_advanced_orders.storage import JsonRuleStore, StorageError, StoredRuleState
+from hl_advanced_orders.models import (
+    ExecutionMode,
+    PositionSide,
+    TrailMode,
+    TrailingStopRule,
+)
+from hl_advanced_orders.storage import LocalStateStore, StorageError
 
 
-class JsonRuleStoreTest(unittest.TestCase):
-    def test_rule_and_state_round_trip_preserves_decimals(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            store = JsonRuleStore(Path(tmp) / "state.json")
+class LocalStateStoreTest(unittest.TestCase):
+    def test_missing_store_loads_empty_state_with_inactive_kill_switch(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = LocalStateStore(Path(temp_dir) / "state.json")
+
+            state = store.load()
+
+            self.assertEqual(state.rules, {})
+            self.assertEqual(state.rule_states, {})
+            self.assertFalse(state.kill_switch_active)
+
+    def test_rule_and_runtime_state_round_trip_without_decimal_precision_loss(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = LocalStateStore(Path(temp_dir) / "state.json")
+            state = store.load()
             rule = TrailingStopRule(
-                coin="eth",
+                coin="ETH",
                 side=PositionSide.LONG,
                 size=Decimal("1.0"),
                 trail_mode=TrailMode.PERCENT,
-                trail_value=Decimal("5"),
+                trail_value=Decimal("7.5"),
             )
-            store.add_rule(rule)
-            snapshot = store.load()
-            snapshot.states[rule.id] = StoredRuleState(
-                protected_size=Decimal("0.4"),
-                processed_fill_ids={"fill_1"},
-            )
-            store.save(snapshot)
+            runtime = state.ensure_rule_state(rule)
+            runtime.protected_size = Decimal("0.4")
 
+            store.save(state)
             loaded = store.load()
 
-            self.assertEqual(loaded.rules[rule.id].coin, "ETH")
-            self.assertEqual(loaded.rules[rule.id].execution_mode.value, "dry_run")
-            self.assertEqual(loaded.states[rule.id].protected_size, Decimal("0.4"))
-            self.assertEqual(loaded.states[rule.id].processed_fill_ids, {"fill_1"})
-
-    def test_missing_store_returns_empty_snapshot_with_inactive_kill_switch(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            snapshot = JsonRuleStore(Path(tmp) / "missing.json").load()
-
-            self.assertEqual(snapshot.rules, {})
-            self.assertFalse(snapshot.kill_switch_active)
+            loaded_rule = loaded.rules[rule.id]
+            loaded_runtime = loaded.rule_states[rule.id]
+            self.assertEqual(loaded_rule.execution_mode, ExecutionMode.DRY_RUN)
+            self.assertEqual(loaded_rule.coin, "ETH")
+            self.assertEqual(loaded_rule.side, PositionSide.LONG)
+            self.assertEqual(loaded_rule.size, Decimal("1.0"))
+            self.assertEqual(loaded_rule.trail_mode, TrailMode.PERCENT)
+            self.assertEqual(loaded_rule.trail_value, Decimal("7.5"))
+            self.assertEqual(loaded_runtime.protected_size, Decimal("0.4"))
 
     def test_malformed_json_raises_storage_error_without_deleting_file(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            path = Path(tmp) / "state.json"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "state.json"
+            path.write_text("{not-json", encoding="utf-8")
+            store = LocalStateStore(path)
+
+            with self.assertRaisesRegex(StorageError, "failed to load local state"):
+                store.load()
+
+            self.assertTrue(path.exists())
+            self.assertEqual(path.read_text(encoding="utf-8"), "{not-json")
+
+    def test_kill_switch_persists_across_store_instances(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "state.json"
+            state = LocalStateStore(path).load()
+            state.kill_switch_active = True
+
+            LocalStateStore(path).save(state)
+            loaded = LocalStateStore(path).load()
+
+            self.assertTrue(loaded.kill_switch_active)
+
+    def test_failed_atomic_replace_leaves_previous_state_loadable(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "state.json"
+            store = LocalStateStore(path)
+            state = store.load()
+            state.kill_switch_active = True
+            store.save(state)
+
+            next_state = store.load()
+            next_state.kill_switch_active = False
+            with patch.object(store, "_replace", side_effect=OSError("replace failed")):
+                with self.assertRaisesRegex(OSError, "replace failed"):
+                    store.save(next_state)
+
+            loaded = LocalStateStore(path).load()
+            self.assertTrue(loaded.kill_switch_active)
+
+    def test_save_fsyncs_parent_directory_after_replace(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = LocalStateStore(Path(temp_dir) / "state.json")
+
+            with patch.object(store, "_fsync_parent_dir") as fsync_parent:
+                store.save(store.load())
+
+            fsync_parent.assert_called_once_with()
+
+    def test_daemon_save_preserves_externally_activated_kill_switch(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "state.json"
+            store = LocalStateStore(path)
+            stale_state = store.load()
+            store.save(stale_state)
+
+            latest_state = store.load()
+            latest_state.kill_switch_active = True
+            store.save(latest_state)
+
+            stale_state.kill_switch_active = False
+            store.save_preserving_active_kill_switch(stale_state)
+
+            self.assertTrue(store.load().kill_switch_active)
+
+    def test_preserve_kill_switch_does_not_overwrite_malformed_state(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "state.json"
+            store = LocalStateStore(path)
+            stale_state = store.load()
             path.write_text("{not-json", encoding="utf-8")
 
             with self.assertRaises(StorageError):
-                JsonRuleStore(path).load()
+                store.save_preserving_active_kill_switch(stale_state)
 
-            self.assertTrue(path.exists())
-
-    def test_kill_switch_persists_across_store_instances(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            path = Path(tmp) / "state.json"
-            JsonRuleStore(path).set_kill_switch(True)
-
-            self.assertTrue(JsonRuleStore(path).load().kill_switch_active)
+            self.assertEqual(path.read_text(encoding="utf-8"), "{not-json")
 
 
 if __name__ == "__main__":

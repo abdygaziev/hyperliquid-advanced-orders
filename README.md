@@ -17,8 +17,9 @@ This project is intentionally local-first. It does not use hosted custody or clo
 
 ## Status
 
-Local daemon MVP. Rules persist locally, dry-run daemon ticks are testable without network access,
-and live submission is blocked unless readiness checks pass.
+Local trailing-stop rule persistence, deterministic daemon ticks, readiness checks, and audit
+events are implemented. Live Hyperliquid access is isolated behind gateway interfaces so normal
+tests run without network access or Keychain access.
 
 ## Development
 
@@ -27,9 +28,21 @@ python3 -m venv .venv
 source .venv/bin/activate
 pip install -e ".[dev]"
 python -m unittest discover -s tests
-ruff check .
 hl-advanced-orders --help
 ```
+
+## Safety Model
+
+Every rule starts in `dry_run`.
+Mainnet `auto_submit` must pass readiness checks and require a typed confirmation phrase before the daemon can submit live orders.
+The exact phrase is:
+
+```text
+ENABLE MAINNET AUTO SUBMIT
+```
+
+The kill switch blocks automated live submissions while preserving local inspection and audit
+review.
 
 ## Local Workflow
 
@@ -39,7 +52,15 @@ Initialize local state:
 hl-advanced-orders init
 ```
 
-Create a dry-run trailing stop rule:
+Store a signing key in macOS Keychain. The private key is prompted without echo and is not written
+to state or audit files:
+
+```bash
+hl-advanced-orders secret store-key --account trader-main
+hl-advanced-orders secret verify-key --account trader-main
+```
+
+Create a dry-run trailing stop for an existing long ETH position:
 
 ```bash
 hl-advanced-orders rule create-trailing \
@@ -50,37 +71,53 @@ hl-advanced-orders rule create-trailing \
   --trail-value 5
 ```
 
-Inspect rules and readiness:
+Attach protection to a newly opening order by recording the opening order identity:
+
+```bash
+hl-advanced-orders rule create-trailing \
+  --coin ETH \
+  --side long \
+  --size 1 \
+  --trail-mode absolute \
+  --trail-value 50 \
+  --attached-order-id 123456
+```
+
+Inspect local rules and readiness:
 
 ```bash
 hl-advanced-orders rule list
-hl-advanced-orders rule readiness <rule-id> --account <address>
+hl-advanced-orders readiness rule_abc123 --account trader-main
 ```
 
-Run one bounded offline daemon tick using a supplied mark price:
+Readiness does not assume a market exists from local state alone. Pass `--market-exists` only
+after verifying the Hyperliquid market through metadata or another trusted live check.
+
+Enable or disable the kill switch:
 
 ```bash
-hl-advanced-orders run --once --mark-price 3100
+hl-advanced-orders kill-switch --enable
+hl-advanced-orders kill-switch --disable
 ```
 
-Persist the kill switch:
+Run a bounded local daemon check:
 
 ```bash
-hl-advanced-orders kill-switch --active
-hl-advanced-orders kill-switch --inactive
+hl-advanced-orders run --once --account-address 0xabc...
 ```
 
-## Safety Model
-
-Every rule starts in `dry_run`.
-Mainnet `auto_submit` must pass readiness checks and require the exact typed phrase
-`ENABLE MAINNET AUTO SUBMIT` before the daemon can submit live orders. Readiness blocks live
-submission when the private key is missing from macOS Keychain, the market is unknown, no live mark
-price has been observed, the kill switch is active, no prior dry-run trigger exists, or the phrase
-does not match.
-
-Private keys are stored through macOS Keychain:
+`auto_submit` rules are still created deliberately per rule:
 
 ```bash
-hl-advanced-orders secret store-key --account <address>
+hl-advanced-orders rule create-trailing \
+  --coin ETH \
+  --side long \
+  --size 1 \
+  --trail-mode percent \
+  --trail-value 5 \
+  --execution-mode auto_submit
 ```
+
+Live submission remains blocked unless readiness passes: Keychain key present, market exists, live
+mark price observed, kill switch inactive, prior dry-run audit evidence exists, and the exact
+confirmation phrase is supplied.

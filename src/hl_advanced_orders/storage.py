@@ -1,18 +1,26 @@
 from __future__ import annotations
 
 import json
+import os
+import tempfile
 from collections import deque
 from dataclasses import dataclass, field
-from datetime import datetime
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
-from .models import ExecutionMode, ExitOrderType, PositionSide, TrailMode, TrailingStopRule
+from .models import (
+    ExecutionMode,
+    ExitOrderType,
+    PositionSide,
+    RuleStatus,
+    TrailMode,
+    TrailingStopRule,
+)
 from .trailing import TrailingStopState
 
 
-SCHEMA_VERSION = 1
+STATE_SCHEMA_VERSION = 1
 
 
 class StorageError(RuntimeError):
@@ -20,174 +28,165 @@ class StorageError(RuntimeError):
 
 
 @dataclass
-class StoredRuleState:
-    protected_size: Decimal = Decimal("0")
-    favorable_price: Decimal | None = None
-    stop_price: Decimal | None = None
-    moving_window: deque[Decimal] = field(default_factory=deque)
-    triggered: bool = False
-    observed_live_mark_price: bool = False
-    processed_fill_ids: set[str] = field(default_factory=set)
-    last_checkpoint_at: str | None = None
-
-
-@dataclass
-class RuleStoreSnapshot:
+class LocalDaemonState:
     rules: dict[str, TrailingStopRule] = field(default_factory=dict)
-    states: dict[str, StoredRuleState] = field(default_factory=dict)
+    rule_states: dict[str, TrailingStopState] = field(default_factory=dict)
     kill_switch_active: bool = False
+    last_fill_seen_by_order: dict[str, str] = field(default_factory=dict)
+    filled_size_by_order: dict[str, Decimal] = field(default_factory=dict)
+    live_mark_observed_rule_ids: set[str] = field(default_factory=set)
+
+    def ensure_rule_state(self, rule: TrailingStopRule) -> TrailingStopState:
+        self.rules[rule.id] = rule
+        if rule.id not in self.rule_states:
+            self.rule_states[rule.id] = TrailingStopState(rule=rule)
+        return self.rule_states[rule.id]
 
 
-class JsonRuleStore:
+class LocalStateStore:
     def __init__(self, path: Path) -> None:
         self.path = path
 
-    def load(self) -> RuleStoreSnapshot:
+    def load(self) -> LocalDaemonState:
         if not self.path.exists():
-            return RuleStoreSnapshot()
+            return LocalDaemonState()
+
         try:
             raw = json.loads(self.path.read_text(encoding="utf-8"))
-        except json.JSONDecodeError as exc:
-            raise StorageError(f"Malformed state file: {self.path}") from exc
-        if raw.get("schema_version") != SCHEMA_VERSION:
-            raise StorageError(f"Unsupported state schema version in {self.path}")
+            return self._decode_state(raw)
+        except (json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
+            raise StorageError(f"failed to load local state from {self.path}: {exc}") from exc
 
-        rules = {
-            rule_id: _rule_from_json(rule_raw)
-            for rule_id, rule_raw in raw.get("rules", {}).items()
+    def save(self, state: LocalDaemonState) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        payload = json.dumps(self._encode_state(state), sort_keys=True, indent=2)
+        fd, temp_name = tempfile.mkstemp(
+            prefix=f".{self.path.name}.",
+            suffix=".tmp",
+            dir=self.path.parent,
+            text=True,
+        )
+        temp_path = Path(temp_name)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(payload)
+                handle.flush()
+                os.fsync(handle.fileno())
+            self._replace(temp_path)
+            self._fsync_parent_dir()
+        except Exception:
+            temp_path.unlink(missing_ok=True)
+            raise
+
+    def _replace(self, temp_path: Path) -> None:
+        temp_path.replace(self.path)
+
+    def _fsync_parent_dir(self) -> None:
+        fd = os.open(self.path.parent, os.O_RDONLY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+
+    def save_preserving_active_kill_switch(self, state: LocalDaemonState) -> None:
+        latest = self.load()
+        state.kill_switch_active = state.kill_switch_active or latest.kill_switch_active
+        self.save(state)
+
+    def _encode_state(self, state: LocalDaemonState) -> dict[str, Any]:
+        return {
+            "schema_version": STATE_SCHEMA_VERSION,
+            "kill_switch_active": state.kill_switch_active,
+            "last_fill_seen_by_order": state.last_fill_seen_by_order,
+            "filled_size_by_order": {
+                key: str(value) for key, value in state.filled_size_by_order.items()
+            },
+            "live_mark_observed_rule_ids": sorted(state.live_mark_observed_rule_ids),
+            "rules": [self._encode_rule(rule) for rule in state.rules.values()],
+            "rule_states": [
+                self._encode_rule_state(rule_id, rule_state)
+                for rule_id, rule_state in state.rule_states.items()
+            ],
         }
-        states = {
-            rule_id: _state_from_json(state_raw)
-            for rule_id, state_raw in raw.get("states", {}).items()
-        }
-        for rule_id in rules:
-            states.setdefault(rule_id, StoredRuleState())
-        return RuleStoreSnapshot(
+
+    def _decode_state(self, raw: dict[str, Any]) -> LocalDaemonState:
+        schema_version = raw.get("schema_version")
+        if schema_version != STATE_SCHEMA_VERSION:
+            raise ValueError(f"unsupported schema_version: {schema_version}")
+
+        rules = {rule.id: rule for rule in (self._decode_rule(item) for item in raw["rules"])}
+        state = LocalDaemonState(
             rules=rules,
-            states=states,
             kill_switch_active=bool(raw.get("kill_switch_active", False)),
+            last_fill_seen_by_order=dict(raw.get("last_fill_seen_by_order", {})),
+            filled_size_by_order={
+                str(key): Decimal(str(value))
+                for key, value in raw.get("filled_size_by_order", {}).items()
+            },
+            live_mark_observed_rule_ids=set(raw.get("live_mark_observed_rule_ids", [])),
+        )
+        for item in raw.get("rule_states", []):
+            rule_id, rule_state = self._decode_rule_state(item, rules)
+            state.rule_states[rule_id] = rule_state
+        for rule in rules.values():
+            state.ensure_rule_state(rule)
+        return state
+
+    def _encode_rule(self, rule: TrailingStopRule) -> dict[str, str | None]:
+        return {
+            "id": rule.id,
+            "coin": rule.coin,
+            "side": rule.side.value,
+            "size": str(rule.size),
+            "trail_mode": rule.trail_mode.value,
+            "trail_value": str(rule.trail_value),
+            "exit_order_type": rule.exit_order_type.value,
+            "execution_mode": rule.execution_mode.value,
+            "status": rule.status.value,
+            "attached_order_id": rule.attached_order_id,
+        }
+
+    def _decode_rule(self, raw: dict[str, Any]) -> TrailingStopRule:
+        return TrailingStopRule(
+            id=str(raw["id"]),
+            coin=str(raw["coin"]),
+            side=PositionSide(str(raw["side"])),
+            size=Decimal(str(raw["size"])),
+            trail_mode=TrailMode(str(raw["trail_mode"])),
+            trail_value=Decimal(str(raw["trail_value"])),
+            exit_order_type=ExitOrderType(str(raw.get("exit_order_type", ExitOrderType.MARKET))),
+            execution_mode=ExecutionMode(str(raw.get("execution_mode", ExecutionMode.DRY_RUN))),
+            status=RuleStatus(str(raw.get("status", RuleStatus.ACTIVE))),
+            attached_order_id=raw.get("attached_order_id"),
         )
 
-    def save(self, snapshot: RuleStoreSnapshot) -> None:
-        payload = {
-            "schema_version": SCHEMA_VERSION,
-            "kill_switch_active": snapshot.kill_switch_active,
-            "rules": {
-                rule_id: _rule_to_json(rule)
-                for rule_id, rule in sorted(snapshot.rules.items())
-            },
-            "states": {
-                rule_id: _state_to_json(state)
-                for rule_id, state in sorted(snapshot.states.items())
-            },
+    def _encode_rule_state(self, rule_id: str, state: TrailingStopState) -> dict[str, Any]:
+        return {
+            "rule_id": rule_id,
+            "protected_size": str(state.protected_size),
+            "favorable_price": str(state.favorable_price) if state.favorable_price is not None else None,
+            "stop_price": str(state.stop_price) if state.stop_price is not None else None,
+            "moving_window": [str(value) for value in state.moving_window],
+            "triggered": state.triggered,
         }
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        tmp_path = self.path.with_suffix(f"{self.path.suffix}.tmp")
-        tmp_path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
-        tmp_path.replace(self.path)
 
-    def add_rule(self, rule: TrailingStopRule) -> None:
-        snapshot = self.load()
-        snapshot.rules[rule.id] = rule
-        snapshot.states.setdefault(rule.id, StoredRuleState())
-        self.save(snapshot)
+    def _decode_rule_state(
+        self,
+        raw: dict[str, Any],
+        rules: dict[str, TrailingStopRule],
+    ) -> tuple[str, TrailingStopState]:
+        rule_id = str(raw["rule_id"])
+        rule = rules[rule_id]
+        return rule_id, TrailingStopState(
+            rule=rule,
+            protected_size=Decimal(str(raw.get("protected_size", "0"))),
+            favorable_price=self._optional_decimal(raw.get("favorable_price")),
+            stop_price=self._optional_decimal(raw.get("stop_price")),
+            moving_window=deque(Decimal(str(value)) for value in raw.get("moving_window", [])),
+            triggered=bool(raw.get("triggered", False)),
+        )
 
-    def set_rule(self, rule: TrailingStopRule, state: StoredRuleState) -> None:
-        snapshot = self.load()
-        snapshot.rules[rule.id] = rule
-        snapshot.states[rule.id] = state
-        self.save(snapshot)
-
-    def set_kill_switch(self, active: bool) -> None:
-        snapshot = self.load()
-        snapshot.kill_switch_active = active
-        self.save(snapshot)
-
-
-def state_from_trailing(state: TrailingStopState, *, observed_live_mark_price: bool) -> StoredRuleState:
-    return StoredRuleState(
-        protected_size=state.protected_size,
-        favorable_price=state.favorable_price,
-        stop_price=state.stop_price,
-        moving_window=deque(state.moving_window),
-        triggered=state.triggered,
-        observed_live_mark_price=observed_live_mark_price,
-        processed_fill_ids=set(state.processed_fill_ids),
-        last_checkpoint_at=datetime.utcnow().isoformat(timespec="seconds") + "Z",
-    )
-
-
-def trailing_from_state(rule: TrailingStopRule, state: StoredRuleState) -> TrailingStopState:
-    return TrailingStopState(
-        rule=rule,
-        protected_size=state.protected_size,
-        favorable_price=state.favorable_price,
-        stop_price=state.stop_price,
-        moving_window=deque(state.moving_window),
-        triggered=state.triggered,
-        processed_fill_ids=set(state.processed_fill_ids),
-    )
-
-
-def _decimal(value: Any) -> Decimal:
-    return Decimal(str(value))
-
-
-def _rule_to_json(rule: TrailingStopRule) -> dict[str, Any]:
-    return {
-        "id": rule.id,
-        "coin": rule.coin,
-        "side": rule.side.value,
-        "size": str(rule.size),
-        "trail_mode": rule.trail_mode.value,
-        "trail_value": str(rule.trail_value),
-        "protect_existing": rule.protect_existing,
-        "opening_order_id": rule.opening_order_id,
-        "disabled": rule.disabled,
-        "exit_order_type": rule.exit_order_type.value,
-        "execution_mode": rule.execution_mode.value,
-    }
-
-
-def _rule_from_json(raw: dict[str, Any]) -> TrailingStopRule:
-    return TrailingStopRule(
-        id=raw["id"],
-        coin=raw["coin"],
-        side=PositionSide(raw["side"]),
-        size=_decimal(raw["size"]),
-        trail_mode=TrailMode(raw["trail_mode"]),
-        trail_value=_decimal(raw["trail_value"]),
-        protect_existing=bool(raw.get("protect_existing", True)),
-        opening_order_id=raw.get("opening_order_id"),
-        disabled=bool(raw.get("disabled", False)),
-        exit_order_type=ExitOrderType(raw.get("exit_order_type", ExitOrderType.MARKET.value)),
-        execution_mode=ExecutionMode(raw.get("execution_mode", ExecutionMode.DRY_RUN.value)),
-    )
-
-
-def _state_to_json(state: StoredRuleState) -> dict[str, Any]:
-    return {
-        "protected_size": str(state.protected_size),
-        "favorable_price": None if state.favorable_price is None else str(state.favorable_price),
-        "stop_price": None if state.stop_price is None else str(state.stop_price),
-        "moving_window": [str(value) for value in state.moving_window],
-        "triggered": state.triggered,
-        "observed_live_mark_price": state.observed_live_mark_price,
-        "processed_fill_ids": sorted(state.processed_fill_ids),
-        "last_checkpoint_at": state.last_checkpoint_at,
-    }
-
-
-def _state_from_json(raw: dict[str, Any]) -> StoredRuleState:
-    return StoredRuleState(
-        protected_size=_decimal(raw.get("protected_size", "0")),
-        favorable_price=None
-        if raw.get("favorable_price") is None
-        else _decimal(raw["favorable_price"]),
-        stop_price=None if raw.get("stop_price") is None else _decimal(raw["stop_price"]),
-        moving_window=deque(_decimal(value) for value in raw.get("moving_window", [])),
-        triggered=bool(raw.get("triggered", False)),
-        observed_live_mark_price=bool(raw.get("observed_live_mark_price", False)),
-        processed_fill_ids=set(raw.get("processed_fill_ids", [])),
-        last_checkpoint_at=raw.get("last_checkpoint_at"),
-    )
+    def _optional_decimal(self, value: Any) -> Decimal | None:
+        if value is None:
+            return None
+        return Decimal(str(value))

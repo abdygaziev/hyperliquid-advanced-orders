@@ -1,157 +1,171 @@
 from __future__ import annotations
 
-import time
+from collections.abc import Callable
+from dataclasses import replace
 from decimal import Decimal
 from typing import Protocol
 
 from .audit import AuditEvent, JsonlAuditLog
-from .hyperliquid_client import AccountGateway, MarketDataGateway
-from .models import FillEvent, ObservationSource, PositionSide
-from .storage import JsonRuleStore, state_from_trailing, trailing_from_state
-from .submission import SubmissionPolicy
-from .trailing import TrailingStopEngine
+from .hyperliquid_client import FillEvent, PositionSnapshot
+from .models import ExecutionMode, PositionSide, PriceSource, PriceTick, RuleStatus, TrailingStopRule
+from .readiness import ReadinessContext
+from .storage import LocalDaemonState, LocalStateStore
+from .submission import SubmissionOutcome, SubmissionPolicy
+from .trailing import TrailingStopEngine, TrailingStopState
 
 
-class ExitPolicy(Protocol):
-    def handle(self, exit_order, snapshot):
+class MarketDataGateway(Protocol):
+    def get_mark_price(self, coin: str) -> PriceTick:
         pass
+
+
+class AccountGateway(Protocol):
+    def get_positions(self) -> list[PositionSnapshot]:
+        pass
+
+    def get_fills(self) -> list[FillEvent]:
+        pass
+
+
+ReadinessContextFactory = Callable[[LocalDaemonState, TrailingStopRule], ReadinessContext | None]
 
 
 class DaemonService:
     def __init__(
         self,
         *,
-        store: JsonRuleStore,
+        store: LocalStateStore,
         audit: JsonlAuditLog,
         market_data: MarketDataGateway,
-        account_gateway: AccountGateway,
-        submission_policy: SubmissionPolicy | ExitPolicy,
-        account: str = "",
+        account: AccountGateway,
         engine: TrailingStopEngine | None = None,
+        submission_policy: SubmissionPolicy | None = None,
+        readiness_context: ReadinessContext | None = None,
+        readiness_context_factory: ReadinessContextFactory | None = None,
     ) -> None:
         self.store = store
         self.audit = audit
         self.market_data = market_data
-        self.account_gateway = account_gateway
-        self.submission_policy = submission_policy
         self.account = account
         self.engine = engine or TrailingStopEngine()
+        self.submission_policy = submission_policy or SubmissionPolicy(audit=audit)
+        self.readiness_context = readiness_context
+        self.readiness_context_factory = readiness_context_factory
 
-    def tick(self) -> int:
-        snapshot = self.store.load()
-        positions = self.account_gateway.positions(self.account) if self.account else []
-        fills = self.account_gateway.fills(self.account) if self.account else []
-        changes = 0
+    def run_once(self) -> None:
+        state = self.store.load()
+        try:
+            positions = self.account.get_positions()
+            fills = self.account.get_fills()
+        except Exception as exc:
+            self.audit.append(
+                AuditEvent.create(
+                    "account_snapshot_failed",
+                    "Failed to load account snapshot.",
+                    payload={"error": str(exc)},
+                )
+            )
+            return
 
-        for rule_id, rule in list(snapshot.rules.items()):
-            if rule.disabled:
+        for rule in list(state.rules.values()):
+            if rule.status == RuleStatus.DISABLED:
                 continue
-            stored_state = snapshot.states[rule_id]
-            trailing_state = trailing_from_state(rule, stored_state)
-            before_protected = trailing_state.protected_size
-
-            if rule.protect_existing:
-                for position in positions:
-                    if position.coin == rule.coin and position.side == rule.side:
-                        trailing_state.increase_protected_size(
-                            min(rule.size, position.size) - trailing_state.protected_size
-                        )
-
-            for fill in fills:
-                if _fill_matches_rule(fill, rule.coin, rule.side, rule.opening_order_id):
-                    fill_id = _stable_fill_id(fill)
-                    if fill_id in trailing_state.processed_fill_ids:
-                        continue
-                    trailing_state.increase_protected_size(fill.size)
-                    trailing_state.processed_fill_ids.add(fill_id)
-
-            if trailing_state.protected_size != before_protected:
+            runtime = state.ensure_rule_state(rule)
+            self._update_protected_size(state, runtime, positions, fills)
+            try:
+                tick = self.market_data.get_mark_price(rule.coin)
+            except Exception as exc:
                 self.audit.append(
                     AuditEvent.create(
-                        "rule_state_changed",
-                        "Protected size updated.",
-                        rule_id=rule_id,
-                        payload={
-                            "coin": rule.coin,
-                            "protected_size": str(trailing_state.protected_size),
-                            "size": str(rule.size),
-                        },
+                        "market_data_failed",
+                        "Failed to load market data.",
+                        rule_id=rule.id,
+                        payload={"coin": rule.coin, "error": str(exc)},
                     )
                 )
-                changes += 1
-
-            tick = self.market_data.latest_price(rule.coin)
-            if tick is None:
-                snapshot.states[rule_id] = state_from_trailing(
-                    trailing_state,
-                    observed_live_mark_price=stored_state.observed_live_mark_price,
-                )
                 continue
+            if tick.coin != rule.coin or tick.source != PriceSource.MARK:
+                continue
+            state.live_mark_observed_rule_ids.add(rule.id)
+            triggered = self.engine.observe(runtime, tick)
+            if triggered is not None:
+                if triggered.execution_mode == ExecutionMode.AUTO_SUBMIT:
+                    self.store.save_preserving_active_kill_switch(state)
+                context = self._readiness_context_for(state, rule)
+                outcome = self.submission_policy.handle(triggered=triggered, rule=rule, context=context)
+                if outcome == SubmissionOutcome.LIVE_BLOCKED:
+                    runtime.triggered = False
 
-            observed_live_mark_price = (
-                stored_state.observed_live_mark_price
-                or tick.source == ObservationSource.LIVE_MARK
+        self.store.save_preserving_active_kill_switch(state)
+
+    def _update_protected_size(
+        self,
+        state: LocalDaemonState,
+        runtime: TrailingStopState,
+        positions: list[PositionSnapshot],
+        fills: list[FillEvent],
+    ) -> None:
+        rule = runtime.rule
+        if rule.attached_order_id:
+            order_key = f"{rule.id}:{rule.attached_order_id}"
+            total_filled = Decimal("0")
+            for fill in fills:
+                if not self._fill_matches_rule(fill, rule.side, rule.coin, rule.attached_order_id):
+                    continue
+                total_filled += fill.size
+                fill_key = fill.fill_id or f"{fill.order_id}:{fill.coin}:{fill.side.value}:{fill.size}"
+                if state.last_fill_seen_by_order.get(fill_key):
+                    continue
+                runtime.increase_protected_size(fill.size)
+                state.last_fill_seen_by_order[fill_key] = rule.id
+            if total_filled > 0:
+                previous_total = state.filled_size_by_order.get(order_key, Decimal("0"))
+                cumulative_total = max(previous_total, total_filled)
+                runtime.protected_size = min(rule.size, cumulative_total)
+                state.filled_size_by_order[order_key] = cumulative_total
+            return
+
+        for position in positions:
+            if position.coin == rule.coin and position.side == rule.side:
+                runtime.protected_size = min(rule.size, position.size)
+                return
+        runtime.protected_size = Decimal("0")
+
+    def _fill_matches_rule(
+        self,
+        fill: FillEvent,
+        side: PositionSide,
+        coin: str,
+        order_id: str,
+    ) -> bool:
+        return fill.coin == coin and fill.side == side and fill.order_id == order_id
+
+    def _readiness_context_for(
+        self,
+        state: LocalDaemonState,
+        rule: TrailingStopRule,
+    ) -> ReadinessContext | None:
+        context = (
+            self.readiness_context_factory(state, rule)
+            if self.readiness_context_factory is not None
+            else self.readiness_context
+        )
+        if context is not None:
+            return replace(
+                context,
+                observed_live_mark_price=(
+                    context.observed_live_mark_price or rule.id in state.live_mark_observed_rule_ids
+                ),
+                kill_switch_active=state.kill_switch_active,
             )
-            exit_order = self.engine.observe(trailing_state, tick)
-            snapshot.states[rule_id] = state_from_trailing(
-                trailing_state,
-                observed_live_mark_price=observed_live_mark_price,
+        if state.kill_switch_active:
+            return ReadinessContext(
+                account="",
+                market_exists=True,
+                observed_live_mark_price=rule.id in state.live_mark_observed_rule_ids,
+                kill_switch_available=True,
+                kill_switch_active=True,
+                dry_run_events_count=1,
+                confirmation_phrase="",
             )
-            if exit_order is not None:
-                self.submission_policy.handle(exit_order, snapshot)
-                changes += 1
-
-        self.store.save(snapshot)
-        return changes
-
-    def run(self, *, interval_seconds: float = 1.0, max_ticks: int | None = None) -> int:
-        ticks = 0
-        while max_ticks is None or ticks < max_ticks:
-            self.tick()
-            ticks += 1
-            if max_ticks is None:
-                time.sleep(interval_seconds)
-        return ticks
-
-
-class EmptyAccountGateway:
-    def positions(self, account: str):
-        return []
-
-    def fills(self, account: str):
-        return []
-
-
-class StaticMarketDataGateway:
-    def __init__(self, prices: dict[str, Decimal] | None = None) -> None:
-        self.prices = {coin.upper(): price for coin, price in (prices or {}).items()}
-
-    def latest_price(self, coin: str):
-        from .models import PriceTick
-
-        price = self.prices.get(coin.upper())
-        if price is None:
-            return None
-        return PriceTick.now(coin, price)
-
-    def market_exists(self, coin: str) -> bool:
-        return coin.upper() in self.prices
-
-
-def _fill_matches_rule(
-    fill: FillEvent,
-    coin: str,
-    side: PositionSide,
-    opening_order_id: str | None,
-) -> bool:
-    if fill.coin != coin or fill.side != side:
-        return False
-    if opening_order_id is None:
-        return True
-    return fill.order_id == opening_order_id
-
-
-def _stable_fill_id(fill: FillEvent) -> str:
-    if fill.fill_id is not None:
-        return fill.fill_id
-    return f"{fill.coin}:{fill.side.value}:{fill.order_id}:{fill.size}"
+        return None

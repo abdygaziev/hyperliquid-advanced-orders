@@ -1,10 +1,15 @@
 from __future__ import annotations
 
 import json
+import os
+import stat
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+
+SENSITIVE_PAYLOAD_KEY_PARTS = ("private_key", "secret", "seed", "mnemonic")
 
 
 @dataclass(frozen=True)
@@ -28,7 +33,7 @@ class AuditEvent:
             event_type=event_type,
             rule_id=rule_id,
             message=message,
-            payload=payload or {},
+            payload=redact_payload(payload or {}),
             created_at=datetime.now(timezone.utc).isoformat(),
         )
 
@@ -39,33 +44,25 @@ class JsonlAuditLog:
 
     def append(self, event: AuditEvent) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        with self.path.open("a", encoding="utf-8") as handle:
+        fd = os.open(self.path, os.O_APPEND | os.O_CREAT | os.O_WRONLY, 0o600)
+        if stat.S_IMODE(os.fstat(fd).st_mode) != 0o600:
+            os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "a", encoding="utf-8") as handle:
             handle.write(json.dumps(asdict(event), default=str, sort_keys=True))
             handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
 
-    def events(self) -> list[AuditEvent]:
-        if not self.path.exists():
-            return []
-        events: list[AuditEvent] = []
-        with self.path.open("r", encoding="utf-8") as handle:
-            for line in handle:
-                if not line.strip():
-                    continue
-                raw = json.loads(line)
-                events.append(
-                    AuditEvent(
-                        event_type=raw["event_type"],
-                        rule_id=raw.get("rule_id"),
-                        message=raw["message"],
-                        payload=raw.get("payload", {}),
-                        created_at=raw["created_at"],
-                    )
-                )
-        return events
 
-    def count_rule_events(self, rule_id: str, event_type: str) -> int:
-        return sum(
-            1
-            for event in self.events()
-            if event.rule_id == rule_id and event.event_type == event_type
-        )
+def redact_payload(value: Any) -> Any:
+    if isinstance(value, dict):
+        redacted: dict[str, Any] = {}
+        for key, item in value.items():
+            if any(part in str(key).lower() for part in SENSITIVE_PAYLOAD_KEY_PARTS):
+                redacted[key] = "[REDACTED]"
+            else:
+                redacted[key] = redact_payload(item)
+        return redacted
+    if isinstance(value, list):
+        return [redact_payload(item) for item in value]
+    return value

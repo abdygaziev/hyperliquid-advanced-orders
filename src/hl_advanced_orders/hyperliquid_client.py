@@ -4,145 +4,177 @@ from dataclasses import dataclass
 from decimal import Decimal
 from typing import Any, Protocol
 
-from .models import ExistingPosition, FillEvent, ObservationSource, PositionSide, PriceTick, TriggeredExit
-from .secrets import KeychainSecrets
+from .models import PositionSide, PriceSource, PriceTick
+from .secrets import SecretStore
 
 
-class MarketDataGateway(Protocol):
-    def latest_price(self, coin: str) -> PriceTick | None:
-        pass
-
-    def market_exists(self, coin: str) -> bool:
-        pass
-
-
-class AccountGateway(Protocol):
-    def positions(self, account: str) -> list[ExistingPosition]:
-        pass
-
-    def fills(self, account: str) -> list[FillEvent]:
-        pass
-
-
-class ExchangeGateway(Protocol):
-    def close_position(self, exit_order: TriggeredExit) -> dict[str, Any]:
-        pass
+class MissingPrivateKeyError(RuntimeError):
+    pass
 
 
 @dataclass(frozen=True)
-class HyperliquidConfig:
-    base_url: str | None = None
-    skip_ws: bool = True
+class PositionSnapshot:
+    coin: str
+    side: PositionSide
+    size: Decimal
 
 
-class HyperliquidInfoGateway:
-    def __init__(self, info: Any) -> None:
-        self.info = info
+@dataclass(frozen=True)
+class FillEvent:
+    coin: str
+    side: PositionSide
+    order_id: str
+    size: Decimal
+    fill_id: str | None = None
 
-    def latest_price(self, coin: str) -> PriceTick | None:
-        coin = coin.upper()
-        if hasattr(self.info, "meta_and_asset_ctxs"):
-            meta_and_ctxs = self.info.meta_and_asset_ctxs()
-            tick = _tick_from_meta_and_asset_ctxs(coin, meta_and_ctxs)
-            if tick is not None:
-                return tick
-        if hasattr(self.info, "all_mids"):
-            mids = self.info.all_mids()
-            if coin in mids:
-                return PriceTick.now(
-                    coin,
-                    Decimal(str(mids[coin])),
-                    source=ObservationSource.MID_PRICE_FALLBACK,
-                )
+
+class InfoClient(Protocol):
+    def all_mids(self) -> dict[str, Any]:
+        pass
+
+    def user_state(self, address: str) -> dict[str, Any]:
+        pass
+
+    def user_fills(self, address: str) -> list[dict[str, Any]]:
+        pass
+
+
+class ExchangeClient(Protocol):
+    def market_close(self, coin: str, sz: Decimal) -> dict[str, Any]:
+        pass
+
+
+class HyperliquidMarketDataGateway:
+    def __init__(self, info: InfoClient | None = None, *, base_url: str | None = None) -> None:
+        self.info = info if info is not None else self._default_info(base_url)
+
+    def get_mark_price(self, coin: str) -> PriceTick:
+        normalized_coin = coin.upper()
+        mark_price = self._mark_price_from_asset_context(normalized_coin)
+        if mark_price is not None:
+            return PriceTick.now(normalized_coin, mark_price, source=PriceSource.MARK)
+
+        mids = self.info.all_mids()
+        if normalized_coin not in mids:
+            raise ValueError(f"missing mark price for {normalized_coin}")
+        return PriceTick.now(normalized_coin, Decimal(str(mids[normalized_coin])), source=PriceSource.MID)
+
+    def _mark_price_from_asset_context(self, coin: str) -> Decimal | None:
+        meta_and_contexts = getattr(self.info, "meta_and_asset_ctxs", None)
+        if meta_and_contexts is None:
+            return None
+        payload = meta_and_contexts()
+        meta, contexts = self._split_meta_and_contexts(payload)
+        universe = meta.get("universe", [])
+        for index, asset in enumerate(universe):
+            if str(asset.get("name", "")).upper() != coin:
+                continue
+            if index >= len(contexts):
+                return None
+            raw_mark = contexts[index].get("markPx")
+            return Decimal(str(raw_mark)) if raw_mark is not None else None
         return None
 
-    def market_exists(self, coin: str) -> bool:
-        coin = coin.upper()
-        if hasattr(self.info, "meta"):
-            meta = self.info.meta()
-            return any(asset.get("name", "").upper() == coin for asset in meta.get("universe", []))
-        return self.latest_price(coin) is not None
+    def _split_meta_and_contexts(self, payload: Any) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+        if isinstance(payload, tuple | list) and len(payload) >= 2:
+            meta = payload[0] if isinstance(payload[0], dict) else {}
+            contexts = payload[1] if isinstance(payload[1], list) else []
+            return meta, contexts
+        if isinstance(payload, dict):
+            meta = payload.get("meta", payload)
+            contexts = payload.get("assetCtxs", payload.get("contexts", []))
+            return meta if isinstance(meta, dict) else {}, contexts if isinstance(contexts, list) else []
+        return {}, []
 
-    def positions(self, account: str) -> list[ExistingPosition]:
-        state = self.info.user_state(account)
-        positions: list[ExistingPosition] = []
-        for entry in state.get("assetPositions", []):
-            position = entry.get("position", entry)
-            size = Decimal(str(position.get("szi", "0")))
-            if size == 0:
+    def _default_info(self, base_url: str | None) -> InfoClient:
+        try:
+            from hyperliquid.info import Info
+        except ImportError as exc:
+            raise RuntimeError("hyperliquid-python-sdk is required for live market data") from exc
+        return Info(base_url=base_url, skip_ws=True) if base_url else Info(skip_ws=True)
+
+
+class HyperliquidAccountGateway:
+    def __init__(self, info: InfoClient, address: str) -> None:
+        self.info = info
+        self.address = address
+
+    def get_positions(self) -> list[PositionSnapshot]:
+        payload = self.info.user_state(self.address)
+        positions: list[PositionSnapshot] = []
+        for item in payload.get("assetPositions", []):
+            raw_position = item.get("position", item)
+            coin = str(raw_position["coin"]).upper()
+            signed_size = Decimal(str(raw_position.get("szi", "0")))
+            if signed_size == 0:
                 continue
-            positions.append(
-                ExistingPosition(
-                    coin=position.get("coin", ""),
-                    side=PositionSide.LONG if size > 0 else PositionSide.SHORT,
-                    size=abs(size),
-                )
-            )
+            side = PositionSide.LONG if signed_size > 0 else PositionSide.SHORT
+            positions.append(PositionSnapshot(coin=coin, side=side, size=abs(signed_size)))
         return positions
 
-    def fills(self, account: str) -> list[FillEvent]:
+    def get_fills(self) -> list[FillEvent]:
         fills: list[FillEvent] = []
-        for raw in self.info.user_fills(account):
-            size = Decimal(str(raw.get("sz", "0")))
-            if size <= 0:
-                continue
-            side = str(raw.get("side", "")).lower()
+        for item in self.info.user_fills(self.address):
             fills.append(
                 FillEvent(
-                    coin=raw.get("coin", ""),
-                    side=PositionSide.LONG if side in {"buy", "b"} else PositionSide.SHORT,
-                    size=size,
-                    order_id=str(raw.get("oid")) if raw.get("oid") is not None else None,
-                    fill_id=_fill_id(raw),
+                    coin=str(item["coin"]).upper(),
+                    side=self._fill_side(item),
+                    order_id=str(item.get("oid", item.get("order_id", ""))),
+                    size=Decimal(str(item.get("sz", item.get("size", "0")))),
+                    fill_id=str(item.get("hash", item.get("tid")))
+                    if item.get("hash", item.get("tid")) is not None
+                    else None,
                 )
             )
         return fills
 
+    def _fill_side(self, item: dict[str, Any]) -> PositionSide:
+        raw_side = str(item.get("side", "")).lower()
+        if raw_side in {"b", "buy", "long"}:
+            return PositionSide.LONG
+        if raw_side in {"a", "sell", "short"}:
+            return PositionSide.SHORT
+        raise ValueError(f"unsupported fill side: {item.get('side')}")
+
 
 class HyperliquidExchangeGateway:
-    def __init__(self, exchange: Any) -> None:
+    def __init__(self, exchange: ExchangeClient) -> None:
         self.exchange = exchange
 
-    def close_position(self, exit_order: TriggeredExit) -> dict[str, Any]:
-        response = self.exchange.market_close(exit_order.coin, float(exit_order.size))
-        return response if isinstance(response, dict) else {"response": response}
+    @classmethod
+    def from_keychain(
+        cls,
+        *,
+        account: str,
+        wallet_address: str,
+        secrets: SecretStore,
+        base_url: str | None = None,
+    ) -> "HyperliquidExchangeGateway":
+        private_key = secrets.get_private_key(account)
+        if private_key is None:
+            raise MissingPrivateKeyError(f"missing private key for account: {account}")
+        exchange = cls._build_exchange(private_key, wallet_address, base_url)
+        return cls(exchange=exchange)
 
+    def submit_market_close(self, coin: str, size: Decimal) -> dict[str, Any]:
+        return self.exchange.market_close(coin.upper(), size)
 
-def build_exchange_gateway(account: str, secrets: KeychainSecrets, config: HyperliquidConfig) -> ExchangeGateway:
-    private_key = secrets.get_private_key(account)
-    if private_key is None:
-        raise RuntimeError("missing private key in macOS Keychain")
-    try:
-        from eth_account import Account  # type: ignore[import-not-found]
-        from hyperliquid.exchange import Exchange  # type: ignore[import-not-found]
-    except ImportError as exc:
-        raise RuntimeError("hyperliquid exchange dependencies are not installed") from exc
-    wallet = Account.from_key(private_key)
-    return HyperliquidExchangeGateway(Exchange(wallet, base_url=config.base_url))
+    @staticmethod
+    def _build_exchange(
+        private_key: str,
+        wallet_address: str,
+        base_url: str | None,
+    ) -> ExchangeClient:
+        try:
+            from eth_account import Account
+            from hyperliquid.exchange import Exchange
+        except ImportError as exc:
+            raise RuntimeError(
+                "hyperliquid-python-sdk and eth-account are required for live submission"
+            ) from exc
 
-
-def build_info_gateway(config: HyperliquidConfig) -> HyperliquidInfoGateway:
-    try:
-        from hyperliquid.info import Info  # type: ignore[import-not-found]
-    except ImportError as exc:
-        raise RuntimeError("hyperliquid info dependency is not installed") from exc
-    return HyperliquidInfoGateway(Info(base_url=config.base_url, skip_ws=config.skip_ws))
-
-
-def _tick_from_meta_and_asset_ctxs(coin: str, payload: Any) -> PriceTick | None:
-    if not isinstance(payload, list) or len(payload) < 2:
-        return None
-    meta, contexts = payload[0], payload[1]
-    universe = meta.get("universe", []) if isinstance(meta, dict) else []
-    for asset, ctx in zip(universe, contexts, strict=False):
-        name = asset.get("name", "").upper()
-        if name == coin and isinstance(ctx, dict) and ctx.get("markPx") is not None:
-            return PriceTick.now(coin, Decimal(str(ctx["markPx"])))
-    return None
-
-
-def _fill_id(raw: dict[str, Any]) -> str:
-    for key in ("hash", "tid", "time", "oid"):
-        if raw.get(key) is not None:
-            return f"{key}:{raw[key]}"
-    return f"{raw.get('coin')}:{raw.get('side')}:{raw.get('sz')}"
+        wallet = Account.from_key(private_key)
+        kwargs: dict[str, Any] = {"account_address": wallet_address}
+        if base_url is not None:
+            kwargs["base_url"] = base_url
+        return Exchange(wallet, **kwargs)

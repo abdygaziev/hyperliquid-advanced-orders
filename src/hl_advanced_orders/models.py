@@ -29,9 +29,14 @@ class ExecutionMode(StrEnum):
     AUTO_SUBMIT = "auto_submit"
 
 
-class ObservationSource(StrEnum):
-    LIVE_MARK = "live_mark"
-    MID_PRICE_FALLBACK = "mid_price_fallback"
+class PriceSource(StrEnum):
+    MARK = "mark"
+    MID = "mid"
+
+
+class RuleStatus(StrEnum):
+    ACTIVE = "active"
+    DISABLED = "disabled"
 
 
 @dataclass(frozen=True)
@@ -41,11 +46,10 @@ class TrailingStopRule:
     size: Decimal
     trail_mode: TrailMode
     trail_value: Decimal
-    protect_existing: bool = True
-    opening_order_id: str | None = None
-    disabled: bool = False
     exit_order_type: ExitOrderType = ExitOrderType.MARKET
     execution_mode: ExecutionMode = ExecutionMode.DRY_RUN
+    status: RuleStatus = RuleStatus.ACTIVE
+    attached_order_id: str | None = None
     id: str = ""
 
     def __post_init__(self) -> None:
@@ -57,7 +61,6 @@ class TrailingStopRule:
             raise ValueError("trail_value must be positive")
         if self.trail_mode == TrailMode.PERCENT and self.trail_value >= 100:
             raise ValueError("percent trail_value must be less than 100")
-        object.__setattr__(self, "coin", self.coin.upper())
 
 
 @dataclass(frozen=True)
@@ -65,46 +68,21 @@ class PriceTick:
     coin: str
     mark_price: Decimal
     observed_at: datetime
-    source: ObservationSource = ObservationSource.LIVE_MARK
+    source: PriceSource = PriceSource.MARK
 
     @classmethod
     def now(
         cls,
         coin: str,
         mark_price: Decimal,
-        source: ObservationSource = ObservationSource.LIVE_MARK,
+        source: PriceSource = PriceSource.MARK,
     ) -> "PriceTick":
         return cls(
-            coin=coin.upper(),
+            coin=coin,
             mark_price=mark_price,
             observed_at=datetime.now(timezone.utc),
             source=source,
         )
-
-    def __post_init__(self) -> None:
-        object.__setattr__(self, "coin", self.coin.upper())
-
-
-@dataclass(frozen=True)
-class ExistingPosition:
-    coin: str
-    side: PositionSide
-    size: Decimal
-
-    def __post_init__(self) -> None:
-        object.__setattr__(self, "coin", self.coin.upper())
-
-
-@dataclass(frozen=True)
-class FillEvent:
-    coin: str
-    side: PositionSide
-    size: Decimal
-    order_id: str | None = None
-    fill_id: str | None = None
-
-    def __post_init__(self) -> None:
-        object.__setattr__(self, "coin", self.coin.upper())
 
 
 @dataclass(frozen=True)
