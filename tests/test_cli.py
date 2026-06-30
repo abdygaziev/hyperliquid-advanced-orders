@@ -3,12 +3,17 @@ from __future__ import annotations
 import json
 import tempfile
 import unittest
+from decimal import Decimal
 from pathlib import Path
 from unittest.mock import patch
 
 from typer.testing import CliRunner
 
+from hl_advanced_orders.audit import AuditEvent, JsonlAuditLog
 from hl_advanced_orders.cli import app
+from hl_advanced_orders.hyperliquid_client import PositionSnapshot
+from hl_advanced_orders.models import PositionSide, PriceTick
+from hl_advanced_orders.storage import LocalStateStore
 
 
 class CliWorkflowTest(unittest.TestCase):
@@ -204,6 +209,173 @@ class CliWorkflowTest(unittest.TestCase):
             calls,
             ["market:http://example", "account:0xabc:True", "daemon:init", "daemon:run_once"],
         )
+
+    def test_run_once_rejects_auto_submit_without_live_options(self) -> None:
+        self.create_auto_submit_rule()
+
+        result = self.invoke(["run", "--once", "--account-address", "0xabc"])
+
+        self.assertNotEqual(result.exit_code, 0)
+        self.assertIn("auto_submit rules require", result.output)
+        self.assertIn("--keychain-account", result.output)
+        self.assertIn("--wallet-address", result.output)
+
+    def test_run_once_wires_live_submission_for_auto_submit_rules(self) -> None:
+        self.create_auto_submit_rule()
+        calls: list[str] = []
+
+        class FakeMarketData:
+            info = object()
+
+            def __init__(self, base_url: str | None = None) -> None:
+                calls.append(f"market:{base_url}")
+
+        class FakeAccountGateway:
+            def __init__(self, info: object, address: str) -> None:
+                calls.append(f"account:{address}:{info is FakeMarketData.info}")
+
+        class FakeExchangeGateway:
+            @classmethod
+            def from_keychain(cls, **kwargs: object) -> object:
+                calls.append(
+                    f"exchange:{kwargs['account']}:{kwargs['wallet_address']}:{kwargs['base_url']}"
+                )
+                return object()
+
+        class FakeDaemon:
+            def __init__(self, **kwargs: object) -> None:
+                calls.append(f"policy:{kwargs['submission_policy'] is not None}")
+                calls.append(f"context:{kwargs['readiness_context_factory'] is not None}")
+
+            def run_once(self) -> None:
+                calls.append("daemon:run_once")
+
+        with (
+            patch("hl_advanced_orders.cli.HyperliquidMarketDataGateway", FakeMarketData),
+            patch("hl_advanced_orders.cli.HyperliquidAccountGateway", FakeAccountGateway),
+            patch("hl_advanced_orders.cli.HyperliquidExchangeGateway", FakeExchangeGateway),
+            patch("hl_advanced_orders.cli.DaemonService", FakeDaemon),
+        ):
+            result = self.invoke(
+                [
+                    "run",
+                    "--once",
+                    "--account-address",
+                    "0xabc",
+                    "--keychain-account",
+                    "trader",
+                    "--wallet-address",
+                    "0xwallet",
+                    "--confirmation-phrase",
+                    "enable mainnet auto submit",
+                    "--market-exists",
+                    "--base-url",
+                    "http://example",
+                ]
+            )
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertEqual(
+            calls,
+            [
+                "market:http://example",
+                "account:0xabc:True",
+                "policy:True",
+                "context:True",
+                "daemon:run_once",
+            ],
+        )
+
+    def test_run_once_missing_key_is_blocked_without_constructing_exchange(self) -> None:
+        rule_id = self.create_auto_submit_rule()
+        store = LocalStateStore(self.data_dir / "state.json")
+        state = store.load()
+        runtime = state.rule_states[rule_id]
+        runtime.protected_size = Decimal("1")
+        runtime.favorable_price = Decimal("100")
+        runtime.stop_price = Decimal("95")
+        store.save(state)
+        JsonlAuditLog(self.data_dir / "audit.jsonl").append(
+            AuditEvent.create("dry_run_exit", "Dry run.", rule_id=rule_id)
+        )
+
+        class FakeSecrets:
+            def has_private_key(self, account: str) -> bool:
+                return False
+
+            def get_private_key(self, account: str) -> str | None:
+                return None
+
+        class FakeMarketData:
+            info = object()
+
+            def __init__(self, base_url: str | None = None) -> None:
+                pass
+
+            def get_mark_price(self, coin: str):
+                return PriceTick.now(coin.upper(), Decimal("49"))
+
+        class FakeAccountGateway:
+            def __init__(self, info: object, address: str) -> None:
+                pass
+
+            def get_positions(self):
+                return [PositionSnapshot("ETH", PositionSide.LONG, Decimal("1"))]
+
+            def get_fills(self):
+                return []
+
+        with (
+            patch("hl_advanced_orders.cli.KeychainSecrets", FakeSecrets),
+            patch("hl_advanced_orders.cli.HyperliquidMarketDataGateway", FakeMarketData),
+            patch("hl_advanced_orders.cli.HyperliquidAccountGateway", FakeAccountGateway),
+            patch(
+                "hl_advanced_orders.cli.HyperliquidExchangeGateway.from_keychain",
+                side_effect=AssertionError("exchange should not be constructed"),
+            ),
+        ):
+            result = self.invoke(
+                [
+                    "run",
+                    "--once",
+                    "--account-address",
+                    "0xabc",
+                    "--keychain-account",
+                    "trader",
+                    "--wallet-address",
+                    "0xwallet",
+                    "--confirmation-phrase",
+                    "ENABLE MAINNET AUTO SUBMIT",
+                    "--market-exists",
+                ]
+            )
+
+        events = read_events(self.data_dir / "audit.jsonl")
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertEqual(events[-1]["event_type"], "live_submission_blocked")
+        self.assertIn("missing private key in macOS Keychain", events[-1]["payload"]["reasons"])
+
+    def create_auto_submit_rule(self) -> str:
+        result = self.invoke(
+            [
+                "rule",
+                "create-trailing",
+                "--coin",
+                "ETH",
+                "--side",
+                "long",
+                "--size",
+                "1",
+                "--trail-mode",
+                "absolute",
+                "--trail-value",
+                "50",
+                "--execution-mode",
+                "auto_submit",
+            ]
+        )
+        self.assertEqual(result.exit_code, 0, result.output)
+        return result.output.split()[1]
 
 
 def read_events(path: Path) -> list[dict[str, object]]:

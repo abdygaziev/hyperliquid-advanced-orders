@@ -4,18 +4,23 @@ import json
 from dataclasses import replace
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 import typer
 
 from . import __version__
 from .audit import AuditEvent, JsonlAuditLog
-from .daemon import DaemonService
-from .hyperliquid_client import HyperliquidAccountGateway, HyperliquidMarketDataGateway
+from .daemon import DaemonService, ReadinessContextFactory
+from .hyperliquid_client import (
+    HyperliquidAccountGateway,
+    HyperliquidExchangeGateway,
+    HyperliquidMarketDataGateway,
+)
 from .models import ExecutionMode, PositionSide, RuleStatus, TrailMode, TrailingStopRule
 from .readiness import ReadinessChecker, ReadinessContext
-from .secrets import KeychainSecrets
+from .secrets import KeychainSecrets, SecretStore
 from .storage import LocalStateStore
+from .submission import SubmissionPolicy
 
 app = typer.Typer(
     help="Local Hyperliquid advanced order daemon.",
@@ -25,6 +30,37 @@ rule_app = typer.Typer(help="Manage advanced order rules.")
 secret_app = typer.Typer(help="Manage local signing secrets.")
 app.add_typer(rule_app, name="rule")
 app.add_typer(secret_app, name="secret")
+
+
+class LiveRunSetup(NamedTuple):
+    submission_policy: SubmissionPolicy | None
+    readiness_context_factory: ReadinessContextFactory | None
+
+
+class LazyHyperliquidExchangeGateway:
+    def __init__(
+        self,
+        *,
+        account: str,
+        wallet_address: str,
+        secrets: SecretStore,
+        base_url: str | None,
+    ) -> None:
+        self.account = account
+        self.wallet_address = wallet_address
+        self.secrets = secrets
+        self.base_url = base_url
+        self.gateway: HyperliquidExchangeGateway | None = None
+
+    def submit_market_close(self, coin: str, size: Decimal) -> dict[str, Any]:
+        if self.gateway is None:
+            self.gateway = HyperliquidExchangeGateway.from_keychain(
+                account=self.account,
+                wallet_address=self.wallet_address,
+                secrets=self.secrets,
+                base_url=self.base_url,
+            )
+        return self.gateway.submit_market_close(coin, size)
 
 
 def default_data_dir() -> Path:
@@ -79,18 +115,57 @@ def run(
         "--account-address",
         help="Hyperliquid wallet address for account state and fills.",
     ),
+    keychain_account: str | None = typer.Option(
+        None,
+        "--keychain-account",
+        help="Keychain account name for live auto-submit signing.",
+    ),
+    wallet_address: str | None = typer.Option(
+        None,
+        "--wallet-address",
+        help="Hyperliquid wallet address for live auto-submit signing.",
+    ),
+    confirmation_phrase: str = typer.Option(
+        "",
+        "--confirmation-phrase",
+        help="Mainnet auto-submit confirmation phrase.",
+    ),
+    market_exists: bool = typer.Option(
+        False,
+        "--market-exists",
+        help="Set only after rule markets have been verified against Hyperliquid metadata.",
+    ),
     base_url: str | None = typer.Option(None, "--base-url", help="Optional Hyperliquid API URL."),
 ) -> None:
     if once:
         if account_address is None:
             raise typer.BadParameter("--account-address is required with --once")
+        store = state_store(ctx)
+        audit = audit_log(ctx)
+        state = store.load()
+        has_auto_submit = any(
+            rule.execution_mode == ExecutionMode.AUTO_SUBMIT and rule.status == RuleStatus.ACTIVE
+            for rule in state.rules.values()
+        )
+        live_setup = configure_live_run(
+            ctx=ctx,
+            audit=audit,
+            has_auto_submit=has_auto_submit,
+            keychain_account=keychain_account,
+            wallet_address=wallet_address,
+            confirmation_phrase=confirmation_phrase,
+            market_exists=market_exists,
+            base_url=base_url,
+        )
         market_data = HyperliquidMarketDataGateway(base_url=base_url)
         account = HyperliquidAccountGateway(info=market_data.info, address=account_address)
         DaemonService(
-            store=state_store(ctx),
-            audit=audit_log(ctx),
+            store=store,
+            audit=audit,
             market_data=market_data,
             account=account,
+            submission_policy=live_setup.submission_policy,
+            readiness_context_factory=live_setup.readiness_context_factory,
         ).run_once()
         typer.echo("Completed one daemon tick.")
         return
@@ -204,13 +279,12 @@ def readiness(
     state = state_store(ctx).load()
     rule = require_rule(state.rules, rule_id)
     checker = ReadinessChecker(KeychainSecrets())
-    context = ReadinessContext(
+    context = build_readiness_context(
+        ctx=ctx,
+        state=state,
+        rule=rule,
         account=account,
         market_exists=market_exists,
-        observed_live_mark_price=rule_id in state.live_mark_observed_rule_ids,
-        kill_switch_available=True,
-        kill_switch_active=state.kill_switch_active,
-        dry_run_events_count=count_rule_events(ctx, rule_id, "dry_run_exit"),
         confirmation_phrase=confirmation_phrase,
     )
     result = checker.check_mainnet_auto_submit(rule, context)
@@ -284,6 +358,98 @@ def audit_log(ctx: typer.Context) -> JsonlAuditLog:
     return JsonlAuditLog(data_dir(ctx) / "audit.jsonl")
 
 
+def configure_live_run(
+    *,
+    ctx: typer.Context,
+    audit: JsonlAuditLog,
+    has_auto_submit: bool,
+    keychain_account: str | None,
+    wallet_address: str | None,
+    confirmation_phrase: str,
+    market_exists: bool,
+    base_url: str | None,
+) -> LiveRunSetup:
+    if not has_auto_submit:
+        return LiveRunSetup(None, None)
+
+    require_live_run_options(
+        keychain_account=keychain_account,
+        wallet_address=wallet_address,
+        confirmation_phrase=confirmation_phrase,
+        market_exists=market_exists,
+    )
+    assert keychain_account is not None
+    assert wallet_address is not None
+
+    secrets = KeychainSecrets()
+    checker = ReadinessChecker(secrets)
+    exchange = LazyHyperliquidExchangeGateway(
+        account=keychain_account,
+        wallet_address=wallet_address,
+        secrets=secrets,
+        base_url=base_url,
+    )
+    submission_policy = SubmissionPolicy(
+        audit=audit,
+        exchange=exchange,
+        readiness_checker=checker,
+    )
+
+    def readiness_context_factory(current_state, rule: TrailingStopRule) -> ReadinessContext:
+        return build_readiness_context(
+            ctx=ctx,
+            state=current_state,
+            rule=rule,
+            account=keychain_account,
+            market_exists=market_exists,
+            confirmation_phrase=confirmation_phrase,
+        )
+
+    return LiveRunSetup(submission_policy, readiness_context_factory)
+
+
+def require_live_run_options(
+    *,
+    keychain_account: str | None,
+    wallet_address: str | None,
+    confirmation_phrase: str,
+    market_exists: bool,
+) -> None:
+    missing_options = []
+    if keychain_account is None:
+        missing_options.append("--keychain-account")
+    if wallet_address is None:
+        missing_options.append("--wallet-address")
+    if not market_exists:
+        missing_options.append("--market-exists")
+    if not confirmation_phrase:
+        missing_options.append("--confirmation-phrase")
+    if missing_options:
+        raise typer.BadParameter(
+            "auto_submit rules require " + ", ".join(missing_options) + " with --once"
+        )
+
+
+def build_readiness_context(
+    *,
+    ctx: typer.Context,
+    state: Any,
+    rule: TrailingStopRule,
+    account: str,
+    market_exists: bool,
+    confirmation_phrase: str,
+) -> ReadinessContext:
+    return ReadinessContext(
+        account=account,
+        market_exists=market_exists,
+        observed_live_mark_price=rule.id in state.live_mark_observed_rule_ids,
+        kill_switch_available=True,
+        kill_switch_active=state.kill_switch_active,
+        dry_run_events_count=count_rule_events(ctx, rule.id, "dry_run_exit"),
+        confirmation_phrase=confirmation_phrase,
+    )
+
+
 def require_rule(rules: dict[str, TrailingStopRule], rule_id: str) -> TrailingStopRule:
     try:
         return rules[rule_id]
@@ -296,8 +462,9 @@ def count_rule_events(ctx: typer.Context, rule_id: str, event_type: str) -> int:
     if not path.exists():
         return 0
     count = 0
-    for line in path.read_text(encoding="utf-8").splitlines():
-        event: dict[str, Any] = json.loads(line)
-        if event.get("rule_id") == rule_id and event.get("event_type") == event_type:
-            count += 1
+    with path.open(encoding="utf-8") as handle:
+        for line in handle:
+            event: dict[str, Any] = json.loads(line)
+            if event.get("rule_id") == rule_id and event.get("event_type") == event_type:
+                count += 1
     return count

@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+from collections.abc import Callable
+from dataclasses import replace
 from decimal import Decimal
 from typing import Protocol
 
-from .audit import JsonlAuditLog
+from .audit import AuditEvent, JsonlAuditLog
 from .hyperliquid_client import FillEvent, PositionSnapshot
-from .models import ExecutionMode, PositionSide, PriceSource, PriceTick, RuleStatus
+from .models import ExecutionMode, PositionSide, PriceSource, PriceTick, RuleStatus, TrailingStopRule
 from .readiness import ReadinessContext
 from .storage import LocalDaemonState, LocalStateStore
 from .submission import SubmissionOutcome, SubmissionPolicy
@@ -25,6 +27,9 @@ class AccountGateway(Protocol):
         pass
 
 
+ReadinessContextFactory = Callable[[LocalDaemonState, TrailingStopRule], ReadinessContext | None]
+
+
 class DaemonService:
     def __init__(
         self,
@@ -36,6 +41,7 @@ class DaemonService:
         engine: TrailingStopEngine | None = None,
         submission_policy: SubmissionPolicy | None = None,
         readiness_context: ReadinessContext | None = None,
+        readiness_context_factory: ReadinessContextFactory | None = None,
     ) -> None:
         self.store = store
         self.audit = audit
@@ -44,53 +50,53 @@ class DaemonService:
         self.engine = engine or TrailingStopEngine()
         self.submission_policy = submission_policy or SubmissionPolicy(audit=audit)
         self.readiness_context = readiness_context
+        self.readiness_context_factory = readiness_context_factory
 
     def run_once(self) -> None:
         state = self.store.load()
-        positions = self.account.get_positions()
-        fills = self.account.get_fills()
+        try:
+            positions = self.account.get_positions()
+            fills = self.account.get_fills()
+        except Exception as exc:
+            self.audit.append(
+                AuditEvent.create(
+                    "account_snapshot_failed",
+                    "Failed to load account snapshot.",
+                    payload={"error": str(exc)},
+                )
+            )
+            return
 
         for rule in list(state.rules.values()):
             if rule.status == RuleStatus.DISABLED:
                 continue
             runtime = state.ensure_rule_state(rule)
             self._update_protected_size(state, runtime, positions, fills)
-            tick = self.market_data.get_mark_price(rule.coin)
-            if tick.coin == rule.coin and tick.source == PriceSource.MARK:
-                state.live_mark_observed_rule_ids.add(rule.id)
+            try:
+                tick = self.market_data.get_mark_price(rule.coin)
+            except Exception as exc:
+                self.audit.append(
+                    AuditEvent.create(
+                        "market_data_failed",
+                        "Failed to load market data.",
+                        rule_id=rule.id,
+                        payload={"coin": rule.coin, "error": str(exc)},
+                    )
+                )
+                continue
+            if tick.coin != rule.coin or tick.source != PriceSource.MARK:
+                continue
+            state.live_mark_observed_rule_ids.add(rule.id)
             triggered = self.engine.observe(runtime, tick)
             if triggered is not None:
-                context = self.readiness_context
-                if context is not None:
-                    context = ReadinessContext(
-                        account=context.account,
-                        market_exists=context.market_exists,
-                        observed_live_mark_price=(
-                            context.observed_live_mark_price
-                            or rule.id in state.live_mark_observed_rule_ids
-                        ),
-                        kill_switch_available=context.kill_switch_available,
-                        kill_switch_active=state.kill_switch_active,
-                        dry_run_events_count=context.dry_run_events_count,
-                        confirmation_phrase=context.confirmation_phrase,
-                    )
-                elif state.kill_switch_active:
-                    context = ReadinessContext(
-                        account="",
-                        market_exists=True,
-                        observed_live_mark_price=rule.id in state.live_mark_observed_rule_ids,
-                        kill_switch_available=True,
-                        kill_switch_active=True,
-                        dry_run_events_count=1,
-                        confirmation_phrase="",
-                    )
                 if triggered.execution_mode == ExecutionMode.AUTO_SUBMIT:
-                    self.store.save(state)
+                    self.store.save_preserving_active_kill_switch(state)
+                context = self._readiness_context_for(state, rule)
                 outcome = self.submission_policy.handle(triggered=triggered, rule=rule, context=context)
-                if outcome in {SubmissionOutcome.LIVE_BLOCKED, SubmissionOutcome.LIVE_FAILED}:
+                if outcome == SubmissionOutcome.LIVE_BLOCKED:
                     runtime.triggered = False
 
-        self.store.save(state)
+        self.store.save_preserving_active_kill_switch(state)
 
     def _update_protected_size(
         self,
@@ -133,3 +139,33 @@ class DaemonService:
         order_id: str,
     ) -> bool:
         return fill.coin == coin and fill.side == side and fill.order_id == order_id
+
+    def _readiness_context_for(
+        self,
+        state: LocalDaemonState,
+        rule: TrailingStopRule,
+    ) -> ReadinessContext | None:
+        context = (
+            self.readiness_context_factory(state, rule)
+            if self.readiness_context_factory is not None
+            else self.readiness_context
+        )
+        if context is not None:
+            return replace(
+                context,
+                observed_live_mark_price=(
+                    context.observed_live_mark_price or rule.id in state.live_mark_observed_rule_ids
+                ),
+                kill_switch_active=state.kill_switch_active,
+            )
+        if state.kill_switch_active:
+            return ReadinessContext(
+                account="",
+                market_exists=True,
+                observed_live_mark_price=rule.id in state.live_mark_observed_rule_ids,
+                kill_switch_available=True,
+                kill_switch_active=True,
+                dry_run_events_count=1,
+                confirmation_phrase="",
+            )
+        return None

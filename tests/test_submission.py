@@ -17,18 +17,21 @@ from hl_advanced_orders.models import (
 )
 from hl_advanced_orders.readiness import MAINNET_CONFIRMATION_PHRASE, ReadinessChecker, ReadinessContext
 from hl_advanced_orders.secrets import InMemorySecrets
-from hl_advanced_orders.submission import SubmissionPolicy
+from hl_advanced_orders.submission import SubmissionOutcome, SubmissionPolicy
 
 
 class FakeExchange:
-    def __init__(self, *, fail: bool = False) -> None:
+    def __init__(self, *, fail: bool = False, response: dict[str, object] | None = None) -> None:
         self.fail = fail
+        self.response = response
         self.calls: list[tuple[str, Decimal]] = []
 
     def submit_market_close(self, coin: str, size: Decimal) -> dict[str, object]:
         self.calls.append((coin, size))
         if self.fail:
             raise RuntimeError("exchange unavailable")
+        if self.response is not None:
+            return self.response
         return {"status": "ok", "coin": coin, "size": str(size)}
 
 
@@ -117,6 +120,36 @@ class SubmissionPolicyTest(unittest.TestCase):
             events = read_events(Path(temp_dir) / "audit.jsonl")
             self.assertEqual(events[-1]["event_type"], "live_submission_failed")
             self.assertIn("exchange unavailable", events[-1]["payload"]["error"])
+
+    def test_rejected_exchange_response_records_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            secrets = InMemorySecrets()
+            secrets.set_private_key("trader", "private-key")
+            policy = SubmissionPolicy(
+                audit=JsonlAuditLog(Path(temp_dir) / "audit.jsonl"),
+                exchange=FakeExchange(
+                    response={
+                        "status": "ok",
+                        "response": {
+                            "type": "order",
+                            "data": {"statuses": [{"error": "Insufficient margin"}]},
+                        },
+                    }
+                ),
+                readiness_checker=ReadinessChecker(secrets),
+            )
+
+            outcome = policy.handle(
+                triggered=live_exit(),
+                rule=rule(ExecutionMode.AUTO_SUBMIT),
+                context=ready_context(),
+            )
+
+            events = read_events(Path(temp_dir) / "audit.jsonl")
+            self.assertEqual(outcome, SubmissionOutcome.LIVE_FAILED)
+            self.assertEqual(events[-1]["event_type"], "live_submission_failed")
+            self.assertEqual(events[-1]["payload"]["outcome"], "rejected")
+            self.assertIn("Insufficient margin", events[-1]["payload"]["error"])
 
 
 def rule(execution_mode: ExecutionMode = ExecutionMode.DRY_RUN) -> TrailingStopRule:

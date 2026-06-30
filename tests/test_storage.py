@@ -93,6 +93,43 @@ class LocalStateStoreTest(unittest.TestCase):
             loaded = LocalStateStore(path).load()
             self.assertTrue(loaded.kill_switch_active)
 
+    def test_save_fsyncs_parent_directory_after_replace(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = LocalStateStore(Path(temp_dir) / "state.json")
+
+            with patch.object(store, "_fsync_parent_dir") as fsync_parent:
+                store.save(store.load())
+
+            fsync_parent.assert_called_once_with()
+
+    def test_daemon_save_preserves_externally_activated_kill_switch(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "state.json"
+            store = LocalStateStore(path)
+            stale_state = store.load()
+            store.save(stale_state)
+
+            latest_state = store.load()
+            latest_state.kill_switch_active = True
+            store.save(latest_state)
+
+            stale_state.kill_switch_active = False
+            store.save_preserving_active_kill_switch(stale_state)
+
+            self.assertTrue(store.load().kill_switch_active)
+
+    def test_preserve_kill_switch_does_not_overwrite_malformed_state(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "state.json"
+            store = LocalStateStore(path)
+            stale_state = store.load()
+            path.write_text("{not-json", encoding="utf-8")
+
+            with self.assertRaises(StorageError):
+                store.save_preserving_active_kill_switch(stale_state)
+
+            self.assertEqual(path.read_text(encoding="utf-8"), "{not-json")
+
 
 if __name__ == "__main__":
     unittest.main()

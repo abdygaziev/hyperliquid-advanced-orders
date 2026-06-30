@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import stat
 import tempfile
 import unittest
 from datetime import datetime
@@ -28,6 +29,7 @@ class AuditLogTest(unittest.TestCase):
             created_at = datetime.fromisoformat(decoded["created_at"])
             self.assertIsNotNone(created_at.tzinfo)
             self.assertIn("+00:00", decoded["created_at"])
+            self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
 
     def test_audit_payload_recursively_redacts_private_key_material(self) -> None:
         event = AuditEvent.create(

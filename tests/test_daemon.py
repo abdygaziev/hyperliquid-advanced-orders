@@ -9,16 +9,30 @@ from pathlib import Path
 from hl_advanced_orders.audit import JsonlAuditLog
 from hl_advanced_orders.daemon import DaemonService
 from hl_advanced_orders.hyperliquid_client import FillEvent, PositionSnapshot
-from hl_advanced_orders.models import ExecutionMode, PositionSide, PriceTick, TrailMode, TrailingStopRule
+from hl_advanced_orders.models import (
+    ExecutionMode,
+    PositionSide,
+    PriceSource,
+    PriceTick,
+    TrailMode,
+    TrailingStopRule,
+)
+from hl_advanced_orders.submission import SubmissionOutcome
 from hl_advanced_orders.storage import LocalStateStore
 
 
 class FakeMarketData:
-    def __init__(self, prices: dict[str, list[Decimal]]) -> None:
+    def __init__(
+        self,
+        prices: dict[str, list[Decimal]],
+        *,
+        source: PriceSource = PriceSource.MARK,
+    ) -> None:
         self.prices = {coin: list(values) for coin, values in prices.items()}
+        self.source = source
 
     def get_mark_price(self, coin: str):
-        return PriceTick.now(coin.upper(), self.prices[coin.upper()].pop(0))
+        return PriceTick.now(coin.upper(), self.prices[coin.upper()].pop(0), source=self.source)
 
 
 class WrongCoinMarketData:
@@ -40,6 +54,32 @@ class FakeAccount:
 
     def get_fills(self) -> list[FillEvent]:
         return self.fills
+
+
+class FailingAccount:
+    def get_positions(self) -> list[PositionSnapshot]:
+        raise RuntimeError("user_state unavailable")
+
+    def get_fills(self) -> list[FillEvent]:
+        raise AssertionError("fills should not be loaded after positions fail")
+
+
+class ReturningSubmissionPolicy:
+    def __init__(self, outcome: SubmissionOutcome) -> None:
+        self.outcome = outcome
+        self.calls = 0
+        self.contexts = []
+
+    def handle(self, **kwargs) -> SubmissionOutcome:
+        self.calls += 1
+        self.contexts.append(kwargs.get("context"))
+        return self.outcome
+
+
+class KillSwitchActivatingStore(LocalStateStore):
+    def save_preserving_active_kill_switch(self, state):
+        state.kill_switch_active = True
+        super().save_preserving_active_kill_switch(state)
 
 
 class DaemonServiceTest(unittest.TestCase):
@@ -167,6 +207,37 @@ class DaemonServiceTest(unittest.TestCase):
             self.assertIsNone(loaded_runtime.stop_price)
             self.assertFalse(loaded_runtime.triggered)
 
+    def test_mid_fallback_tick_does_not_trigger_rule(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = LocalStateStore(Path(temp_dir) / "state.json")
+            state = store.load()
+            rule = TrailingStopRule(
+                coin="ETH",
+                side=PositionSide.LONG,
+                size=Decimal("1"),
+                trail_mode=TrailMode.ABSOLUTE,
+                trail_value=Decimal("5"),
+            )
+            runtime = state.ensure_rule_state(rule)
+            runtime.protected_size = Decimal("1")
+            runtime.favorable_price = Decimal("100")
+            runtime.stop_price = Decimal("95")
+            store.save(state)
+            audit_path = Path(temp_dir) / "audit.jsonl"
+            daemon = DaemonService(
+                store=store,
+                audit=JsonlAuditLog(audit_path),
+                market_data=FakeMarketData({"ETH": [Decimal("94")]}, source=PriceSource.MID),
+                account=FakeAccount(positions=[PositionSnapshot("ETH", PositionSide.LONG, Decimal("1"))]),
+            )
+
+            daemon.run_once()
+
+            loaded = store.load()
+            self.assertFalse(loaded.rule_states[rule.id].triggered)
+            self.assertNotIn(rule.id, loaded.live_mark_observed_rule_ids)
+            self.assertEqual(read_events(audit_path), [])
+
     def test_missing_existing_position_clears_protected_size(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             store = LocalStateStore(Path(temp_dir) / "state.json")
@@ -221,6 +292,97 @@ class DaemonServiceTest(unittest.TestCase):
             daemon.run_once()
 
             self.assertEqual(len(read_events(audit_path)), 1)
+
+    def test_account_snapshot_failure_audits_and_preserves_state(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = LocalStateStore(Path(temp_dir) / "state.json")
+            state = store.load()
+            rule = TrailingStopRule(
+                coin="ETH",
+                side=PositionSide.LONG,
+                size=Decimal("1"),
+                trail_mode=TrailMode.ABSOLUTE,
+                trail_value=Decimal("5"),
+            )
+            state.ensure_rule_state(rule).protected_size = Decimal("1")
+            store.save(state)
+            audit_path = Path(temp_dir) / "audit.jsonl"
+            daemon = DaemonService(
+                store=store,
+                audit=JsonlAuditLog(audit_path),
+                market_data=FakeMarketData({"ETH": [Decimal("94")]}),
+                account=FailingAccount(),
+            )
+
+            daemon.run_once()
+
+            events = read_events(audit_path)
+            self.assertEqual(events[-1]["event_type"], "account_snapshot_failed")
+            self.assertIn("user_state unavailable", events[-1]["payload"]["error"])
+            self.assertFalse(store.load().rule_states[rule.id].triggered)
+
+    def test_live_failure_keeps_rule_triggered_to_avoid_duplicate_retry(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = LocalStateStore(Path(temp_dir) / "state.json")
+            state = store.load()
+            rule = TrailingStopRule(
+                coin="ETH",
+                side=PositionSide.LONG,
+                size=Decimal("1"),
+                trail_mode=TrailMode.ABSOLUTE,
+                trail_value=Decimal("5"),
+                execution_mode=ExecutionMode.AUTO_SUBMIT,
+            )
+            runtime = state.ensure_rule_state(rule)
+            runtime.protected_size = Decimal("1")
+            runtime.favorable_price = Decimal("100")
+            runtime.stop_price = Decimal("95")
+            store.save(state)
+            policy = ReturningSubmissionPolicy(SubmissionOutcome.LIVE_FAILED)
+            daemon = DaemonService(
+                store=store,
+                audit=JsonlAuditLog(Path(temp_dir) / "audit.jsonl"),
+                market_data=FakeMarketData({"ETH": [Decimal("94"), Decimal("93")]}),
+                account=FakeAccount(positions=[PositionSnapshot("ETH", PositionSide.LONG, Decimal("1"))]),
+                submission_policy=policy,
+            )
+
+            daemon.run_once()
+            daemon.run_once()
+
+            self.assertTrue(store.load().rule_states[rule.id].triggered)
+            self.assertEqual(policy.calls, 1)
+
+    def test_presubmit_kill_switch_refresh_blocks_current_live_submission(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = KillSwitchActivatingStore(Path(temp_dir) / "state.json")
+            state = store.load()
+            rule = TrailingStopRule(
+                coin="ETH",
+                side=PositionSide.LONG,
+                size=Decimal("1"),
+                trail_mode=TrailMode.ABSOLUTE,
+                trail_value=Decimal("5"),
+                execution_mode=ExecutionMode.AUTO_SUBMIT,
+            )
+            runtime = state.ensure_rule_state(rule)
+            runtime.protected_size = Decimal("1")
+            runtime.favorable_price = Decimal("100")
+            runtime.stop_price = Decimal("95")
+            store.save(state)
+            policy = ReturningSubmissionPolicy(SubmissionOutcome.LIVE_BLOCKED)
+            daemon = DaemonService(
+                store=store,
+                audit=JsonlAuditLog(Path(temp_dir) / "audit.jsonl"),
+                market_data=FakeMarketData({"ETH": [Decimal("94")]}),
+                account=FakeAccount(positions=[PositionSnapshot("ETH", PositionSide.LONG, Decimal("1"))]),
+                submission_policy=policy,
+            )
+
+            daemon.run_once()
+
+            self.assertEqual(policy.calls, 1)
+            self.assertTrue(policy.contexts[-1].kill_switch_active)
 
     def test_kill_switch_blocks_live_submission_as_audit_event(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

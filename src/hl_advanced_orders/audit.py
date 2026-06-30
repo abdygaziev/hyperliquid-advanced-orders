@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import os
+import stat
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -42,9 +44,14 @@ class JsonlAuditLog:
 
     def append(self, event: AuditEvent) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        with self.path.open("a", encoding="utf-8") as handle:
+        fd = os.open(self.path, os.O_APPEND | os.O_CREAT | os.O_WRONLY, 0o600)
+        if stat.S_IMODE(os.fstat(fd).st_mode) != 0o600:
+            os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "a", encoding="utf-8") as handle:
             handle.write(json.dumps(asdict(event), default=str, sort_keys=True))
             handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
 
 
 def redact_payload(value: Any) -> Any:

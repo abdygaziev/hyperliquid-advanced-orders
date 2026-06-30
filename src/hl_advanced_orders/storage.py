@@ -73,12 +73,25 @@ class LocalStateStore:
                 handle.flush()
                 os.fsync(handle.fileno())
             self._replace(temp_path)
+            self._fsync_parent_dir()
         except Exception:
             temp_path.unlink(missing_ok=True)
             raise
 
     def _replace(self, temp_path: Path) -> None:
         temp_path.replace(self.path)
+
+    def _fsync_parent_dir(self) -> None:
+        fd = os.open(self.path.parent, os.O_RDONLY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+
+    def save_preserving_active_kill_switch(self, state: LocalDaemonState) -> None:
+        latest = self.load()
+        state.kill_switch_active = state.kill_switch_active or latest.kill_switch_active
+        self.save(state)
 
     def _encode_state(self, state: LocalDaemonState) -> dict[str, Any]:
         return {
