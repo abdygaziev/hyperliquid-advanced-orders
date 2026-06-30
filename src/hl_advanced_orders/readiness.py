@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from .models import TrailingStopRule
-from .secrets import KeychainSecrets
+from .secrets import SecretStore
 
 
 MAINNET_CONFIRMATION_PHRASE = "ENABLE MAINNET AUTO SUBMIT"
@@ -27,7 +27,7 @@ class ReadinessContext:
 
 
 class ReadinessChecker:
-    def __init__(self, secrets: KeychainSecrets) -> None:
+    def __init__(self, secrets: SecretStore) -> None:
         self.secrets = secrets
 
     def check_mainnet_auto_submit(

@@ -29,6 +29,16 @@ class ExecutionMode(StrEnum):
     AUTO_SUBMIT = "auto_submit"
 
 
+class PriceSource(StrEnum):
+    MARK = "mark"
+    MID = "mid"
+
+
+class RuleStatus(StrEnum):
+    ACTIVE = "active"
+    DISABLED = "disabled"
+
+
 @dataclass(frozen=True)
 class TrailingStopRule:
     coin: str
@@ -38,6 +48,8 @@ class TrailingStopRule:
     trail_value: Decimal
     exit_order_type: ExitOrderType = ExitOrderType.MARKET
     execution_mode: ExecutionMode = ExecutionMode.DRY_RUN
+    status: RuleStatus = RuleStatus.ACTIVE
+    attached_order_id: str | None = None
     id: str = ""
 
     def __post_init__(self) -> None:
@@ -56,10 +68,21 @@ class PriceTick:
     coin: str
     mark_price: Decimal
     observed_at: datetime
+    source: PriceSource = PriceSource.MARK
 
     @classmethod
-    def now(cls, coin: str, mark_price: Decimal) -> "PriceTick":
-        return cls(coin=coin, mark_price=mark_price, observed_at=datetime.now(timezone.utc))
+    def now(
+        cls,
+        coin: str,
+        mark_price: Decimal,
+        source: PriceSource = PriceSource.MARK,
+    ) -> "PriceTick":
+        return cls(
+            coin=coin,
+            mark_price=mark_price,
+            observed_at=datetime.now(timezone.utc),
+            source=source,
+        )
 
 
 @dataclass(frozen=True)
