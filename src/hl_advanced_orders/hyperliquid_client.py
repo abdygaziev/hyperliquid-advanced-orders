@@ -13,6 +13,13 @@ class MissingPrivateKeyError(RuntimeError):
 
 
 @dataclass(frozen=True)
+class MarketMetadata:
+    coin: str
+    exists: bool
+    source: str
+
+
+@dataclass(frozen=True)
 class PositionSnapshot:
     coin: str
     side: PositionSide
@@ -32,6 +39,9 @@ class InfoClient(Protocol):
     def meta(self, dex: str = "") -> dict[str, Any]:
         pass
 
+    def meta_and_asset_ctxs(self) -> Any:
+        pass
+
     def all_mids(self) -> dict[str, Any]:
         pass
 
@@ -44,6 +54,9 @@ class InfoClient(Protocol):
 
 class ExchangeClient(Protocol):
     def market_close(self, coin: str, sz: Decimal) -> dict[str, Any]:
+        pass
+
+    def schedule_cancel(self, time: int | None) -> dict[str, Any]:
         pass
 
 
@@ -62,24 +75,31 @@ class HyperliquidMarketDataGateway:
             raise ValueError(f"missing mark price for {normalized_coin}")
         return PriceTick.now(normalized_coin, Decimal(str(mids[normalized_coin])), source=PriceSource.MID)
 
-    def market_exists(self, coin: str) -> bool:
+    def get_market_metadata(self, coin: str) -> MarketMetadata:
         normalized_coin = coin.upper()
         meta = self._metadata()
         universe = meta.get("universe", [])
-        return any(str(asset.get("name", "")).upper() == normalized_coin for asset in universe)
+        exists = any(str(asset.get("name", "")).upper() == normalized_coin for asset in universe)
+        return MarketMetadata(coin=normalized_coin, exists=exists, source="hyperliquid_metadata")
+
+    def market_exists(self, coin: str) -> bool:
+        return self.get_market_metadata(coin).exists
 
     def _metadata(self) -> dict[str, Any]:
-        try:
-            return self.info.meta()
-        except AttributeError:
-            payload = self._meta_and_asset_contexts_payload()
-            meta, _ = self._split_meta_and_contexts(payload)
-            return meta
-
-    def _mark_price_from_asset_context(self, coin: str) -> Decimal | None:
+        meta = getattr(self.info, "meta", None)
+        if meta is not None:
+            return meta()
         payload = self._meta_and_asset_contexts_payload()
         if payload is None:
+            return {}
+        metadata, _contexts = self._split_meta_and_contexts(payload)
+        return metadata
+
+    def _mark_price_from_asset_context(self, coin: str) -> Decimal | None:
+        meta_and_contexts = getattr(self.info, "meta_and_asset_ctxs", None)
+        if meta_and_contexts is None:
             return None
+        payload = meta_and_contexts()
         meta, contexts = self._split_meta_and_contexts(payload)
         universe = meta.get("universe", [])
         for index, asset in enumerate(universe):
@@ -90,12 +110,6 @@ class HyperliquidMarketDataGateway:
             raw_mark = contexts[index].get("markPx")
             return Decimal(str(raw_mark)) if raw_mark is not None else None
         return None
-
-    def _meta_and_asset_contexts_payload(self) -> Any:
-        meta_and_contexts = getattr(self.info, "meta_and_asset_ctxs", None)
-        if meta_and_contexts is None:
-            return None
-        return meta_and_contexts()
 
     def _split_meta_and_contexts(self, payload: Any) -> tuple[dict[str, Any], list[dict[str, Any]]]:
         if isinstance(payload, tuple | list) and len(payload) >= 2:
@@ -180,6 +194,9 @@ class HyperliquidExchangeGateway:
 
     def submit_market_close(self, coin: str, size: Decimal) -> dict[str, Any]:
         return self.exchange.market_close(coin.upper(), size)
+
+    def schedule_cancel(self, time_ms: int | None) -> dict[str, Any]:
+        return self.exchange.schedule_cancel(time_ms)
 
     @staticmethod
     def _build_exchange(

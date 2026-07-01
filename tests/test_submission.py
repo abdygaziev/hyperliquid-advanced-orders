@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import tempfile
 import unittest
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 
@@ -10,6 +11,7 @@ from hl_advanced_orders.audit import JsonlAuditLog
 from hl_advanced_orders.models import (
     ExecutionMode,
     ExitOrderType,
+    LiveEnablementStatus,
     PositionSide,
     TrailMode,
     TrailingStopRule,
@@ -92,7 +94,7 @@ class SubmissionPolicyTest(unittest.TestCase):
 
             policy.handle(
                 triggered=live_exit(),
-                rule=rule(ExecutionMode.AUTO_SUBMIT),
+                rule=rule(ExecutionMode.AUTO_SUBMIT, live_status=LiveEnablementStatus.NORMAL_LIVE),
                 context=ready_context(),
             )
 
@@ -113,7 +115,7 @@ class SubmissionPolicyTest(unittest.TestCase):
 
             policy.handle(
                 triggered=live_exit(),
-                rule=rule(ExecutionMode.AUTO_SUBMIT),
+                rule=rule(ExecutionMode.AUTO_SUBMIT, live_status=LiveEnablementStatus.NORMAL_LIVE),
                 context=ready_context(),
             )
 
@@ -141,7 +143,7 @@ class SubmissionPolicyTest(unittest.TestCase):
 
             outcome = policy.handle(
                 triggered=live_exit(),
-                rule=rule(ExecutionMode.AUTO_SUBMIT),
+                rule=rule(ExecutionMode.AUTO_SUBMIT, live_status=LiveEnablementStatus.NORMAL_LIVE),
                 context=ready_context(),
             )
 
@@ -151,8 +153,132 @@ class SubmissionPolicyTest(unittest.TestCase):
             self.assertEqual(events[-1]["payload"]["outcome"], "rejected")
             self.assertIn("Insufficient margin", events[-1]["payload"]["error"])
 
+    def test_ambiguous_exchange_response_records_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            secrets = InMemorySecrets()
+            secrets.set_private_key("trader", "private-key")
+            policy = SubmissionPolicy(
+                audit=JsonlAuditLog(Path(temp_dir) / "audit.jsonl"),
+                exchange=FakeExchange(response={"response": {"type": "order"}}),
+                readiness_checker=ReadinessChecker(secrets),
+            )
 
-def rule(execution_mode: ExecutionMode = ExecutionMode.DRY_RUN) -> TrailingStopRule:
+            outcome = policy.handle(
+                triggered=live_exit(),
+                rule=rule(ExecutionMode.AUTO_SUBMIT, live_status=LiveEnablementStatus.NORMAL_LIVE),
+                context=ready_context(),
+            )
+
+            events = read_events(Path(temp_dir) / "audit.jsonl")
+            self.assertEqual(outcome, SubmissionOutcome.LIVE_FAILED)
+            self.assertIn("missing exchange status", events[-1]["payload"]["error"])
+
+    def test_stale_mark_observation_blocks_live_submission(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            secrets = InMemorySecrets()
+            secrets.set_private_key("trader", "private-key")
+            exchange = FakeExchange()
+            policy = SubmissionPolicy(
+                audit=JsonlAuditLog(Path(temp_dir) / "audit.jsonl"),
+                exchange=exchange,
+                readiness_checker=ReadinessChecker(secrets),
+                max_mark_age=timedelta(minutes=5),
+            )
+
+            outcome = policy.handle(
+                triggered=live_exit(
+                    mark_observed_at=datetime.now(timezone.utc) - timedelta(minutes=10)
+                ),
+                rule=rule(ExecutionMode.AUTO_SUBMIT, live_status=LiveEnablementStatus.NORMAL_LIVE),
+                context=ready_context(),
+            )
+
+            events = read_events(Path(temp_dir) / "audit.jsonl")
+            self.assertEqual(outcome, SubmissionOutcome.LIVE_BLOCKED)
+            self.assertEqual(exchange.calls, [])
+            self.assertIn("mark price observation is stale", events[-1]["payload"]["reasons"])
+
+    def test_auto_submit_without_canary_evidence_blocks_normal_live(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            secrets = InMemorySecrets()
+            secrets.set_private_key("trader", "private-key")
+            exchange = FakeExchange()
+            policy = SubmissionPolicy(
+                audit=JsonlAuditLog(Path(temp_dir) / "audit.jsonl"),
+                exchange=exchange,
+                readiness_checker=ReadinessChecker(secrets),
+            )
+
+            outcome = policy.handle(
+                triggered=live_exit(),
+                rule=rule(ExecutionMode.AUTO_SUBMIT),
+                context=ready_context(),
+            )
+
+            events = read_events(Path(temp_dir) / "audit.jsonl")
+            self.assertEqual(outcome, SubmissionOutcome.LIVE_BLOCKED)
+            self.assertEqual(exchange.calls, [])
+            self.assertIn(
+                "canary evidence is required before normal live auto_submit",
+                events[-1]["payload"]["reasons"],
+            )
+
+    def test_canary_mode_allows_pending_rule_when_ready(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            secrets = InMemorySecrets()
+            secrets.set_private_key("trader", "private-key")
+            exchange = FakeExchange()
+            policy = SubmissionPolicy(
+                audit=JsonlAuditLog(Path(temp_dir) / "audit.jsonl"),
+                exchange=exchange,
+                readiness_checker=ReadinessChecker(secrets),
+                canary_mode=True,
+            )
+
+            outcome = policy.handle(
+                triggered=live_exit(),
+                rule=rule(ExecutionMode.AUTO_SUBMIT),
+                context=ready_context(),
+            )
+
+            events = read_events(Path(temp_dir) / "audit.jsonl")
+            self.assertEqual(outcome, SubmissionOutcome.LIVE_SUBMITTED)
+            self.assertEqual(exchange.calls, [("ETH", Decimal("0.4"))])
+            self.assertTrue(events[-1]["payload"]["canary_mode"])
+            self.assertEqual(events[-1]["payload"]["live_status"], "canary_pending")
+
+    def test_manual_review_rule_blocks_live_submission(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            secrets = InMemorySecrets()
+            secrets.set_private_key("trader", "private-key")
+            exchange = FakeExchange()
+            policy = SubmissionPolicy(
+                audit=JsonlAuditLog(Path(temp_dir) / "audit.jsonl"),
+                exchange=exchange,
+                readiness_checker=ReadinessChecker(secrets),
+                canary_mode=True,
+            )
+
+            outcome = policy.handle(
+                triggered=live_exit(),
+                rule=rule(
+                    ExecutionMode.AUTO_SUBMIT,
+                    live_status=LiveEnablementStatus.MANUAL_REVIEW,
+                ),
+                context=ready_context(),
+            )
+
+            events = read_events(Path(temp_dir) / "audit.jsonl")
+            self.assertEqual(outcome, SubmissionOutcome.LIVE_BLOCKED)
+            self.assertEqual(exchange.calls, [])
+            self.assertIn("rule requires manual review", events[-1]["payload"]["reasons"])
+
+
+def rule(
+    execution_mode: ExecutionMode = ExecutionMode.DRY_RUN,
+    *,
+    live_status: LiveEnablementStatus = LiveEnablementStatus.DRY_RUN,
+) -> TrailingStopRule:
     return TrailingStopRule(
         id="rule_123",
         coin="ETH",
@@ -161,6 +287,7 @@ def rule(execution_mode: ExecutionMode = ExecutionMode.DRY_RUN) -> TrailingStopR
         trail_mode=TrailMode.ABSOLUTE,
         trail_value=Decimal("50"),
         execution_mode=execution_mode,
+        live_status=live_status,
     )
 
 
@@ -178,7 +305,7 @@ def dry_run_exit() -> TriggeredExit:
     )
 
 
-def live_exit() -> TriggeredExit:
+def live_exit(mark_observed_at=None) -> TriggeredExit:
     return TriggeredExit(
         rule_id="rule_123",
         coin="ETH",
@@ -189,6 +316,7 @@ def live_exit() -> TriggeredExit:
         stop_price=Decimal("100"),
         execution_mode=ExecutionMode.AUTO_SUBMIT,
         exit_order_type=ExitOrderType.MARKET,
+        mark_observed_at=mark_observed_at or datetime.now(timezone.utc),
     )
 
 

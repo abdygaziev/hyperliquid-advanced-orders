@@ -12,6 +12,7 @@ from typing import Any
 from .models import (
     ExecutionMode,
     ExitOrderType,
+    LiveEnablementStatus,
     PositionSide,
     RuleStatus,
     TrailMode,
@@ -20,11 +21,24 @@ from .models import (
 from .trailing import TrailingStopState
 
 
-STATE_SCHEMA_VERSION = 1
+STATE_SCHEMA_VERSION = 2
 
 
 class StorageError(RuntimeError):
     pass
+
+
+@dataclass
+class DaemonHealth:
+    mode: str = "idle"
+    last_tick_started_at: str | None = None
+    last_tick_completed_at: str | None = None
+    last_successful_account_snapshot_at: str | None = None
+    last_successful_market_snapshot_at: str | None = None
+    consecutive_failures: int = 0
+    active_error: str | None = None
+    active_rules_count: int = 0
+    last_blocked_reasons: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -35,6 +49,8 @@ class LocalDaemonState:
     last_fill_seen_by_order: dict[str, str] = field(default_factory=dict)
     filled_size_by_order: dict[str, Decimal] = field(default_factory=dict)
     live_mark_observed_rule_ids: set[str] = field(default_factory=set)
+    live_mark_observed_at_by_rule: dict[str, str] = field(default_factory=dict)
+    health: DaemonHealth = field(default_factory=DaemonHealth)
 
     def ensure_rule_state(self, rule: TrailingStopRule) -> TrailingStopState:
         self.rules[rule.id] = rule
@@ -97,11 +113,13 @@ class LocalStateStore:
         return {
             "schema_version": STATE_SCHEMA_VERSION,
             "kill_switch_active": state.kill_switch_active,
+            "health": self._encode_health(state.health),
             "last_fill_seen_by_order": state.last_fill_seen_by_order,
             "filled_size_by_order": {
                 key: str(value) for key, value in state.filled_size_by_order.items()
             },
             "live_mark_observed_rule_ids": sorted(state.live_mark_observed_rule_ids),
+            "live_mark_observed_at_by_rule": state.live_mark_observed_at_by_rule,
             "rules": [self._encode_rule(rule) for rule in state.rules.values()],
             "rule_states": [
                 self._encode_rule_state(rule_id, rule_state)
@@ -111,7 +129,7 @@ class LocalStateStore:
 
     def _decode_state(self, raw: dict[str, Any]) -> LocalDaemonState:
         schema_version = raw.get("schema_version")
-        if schema_version != STATE_SCHEMA_VERSION:
+        if schema_version not in {1, STATE_SCHEMA_VERSION}:
             raise ValueError(f"unsupported schema_version: {schema_version}")
 
         rules = {rule.id: rule for rule in (self._decode_rule(item) for item in raw["rules"])}
@@ -124,6 +142,11 @@ class LocalStateStore:
                 for key, value in raw.get("filled_size_by_order", {}).items()
             },
             live_mark_observed_rule_ids=set(raw.get("live_mark_observed_rule_ids", [])),
+            live_mark_observed_at_by_rule={
+                str(key): str(value)
+                for key, value in raw.get("live_mark_observed_at_by_rule", {}).items()
+            },
+            health=self._decode_health(raw.get("health", {})),
         )
         for item in raw.get("rule_states", []):
             rule_id, rule_state = self._decode_rule_state(item, rules)
@@ -131,6 +154,34 @@ class LocalStateStore:
         for rule in rules.values():
             state.ensure_rule_state(rule)
         return state
+
+    def _encode_health(self, health: DaemonHealth) -> dict[str, Any]:
+        return {
+            "mode": health.mode,
+            "last_tick_started_at": health.last_tick_started_at,
+            "last_tick_completed_at": health.last_tick_completed_at,
+            "last_successful_account_snapshot_at": health.last_successful_account_snapshot_at,
+            "last_successful_market_snapshot_at": health.last_successful_market_snapshot_at,
+            "consecutive_failures": health.consecutive_failures,
+            "active_error": health.active_error,
+            "active_rules_count": health.active_rules_count,
+            "last_blocked_reasons": list(health.last_blocked_reasons),
+        }
+
+    def _decode_health(self, raw: Any) -> DaemonHealth:
+        if not isinstance(raw, dict):
+            return DaemonHealth()
+        return DaemonHealth(
+            mode=str(raw.get("mode", "idle")),
+            last_tick_started_at=raw.get("last_tick_started_at"),
+            last_tick_completed_at=raw.get("last_tick_completed_at"),
+            last_successful_account_snapshot_at=raw.get("last_successful_account_snapshot_at"),
+            last_successful_market_snapshot_at=raw.get("last_successful_market_snapshot_at"),
+            consecutive_failures=int(raw.get("consecutive_failures", 0)),
+            active_error=raw.get("active_error"),
+            active_rules_count=int(raw.get("active_rules_count", 0)),
+            last_blocked_reasons=[str(reason) for reason in raw.get("last_blocked_reasons", [])],
+        )
 
     def _encode_rule(self, rule: TrailingStopRule) -> dict[str, str | None]:
         return {
@@ -143,6 +194,7 @@ class LocalStateStore:
             "exit_order_type": rule.exit_order_type.value,
             "execution_mode": rule.execution_mode.value,
             "status": rule.status.value,
+            "live_status": rule.live_status.value,
             "attached_order_id": rule.attached_order_id,
         }
 
@@ -157,6 +209,9 @@ class LocalStateStore:
             exit_order_type=ExitOrderType(str(raw.get("exit_order_type", ExitOrderType.MARKET))),
             execution_mode=ExecutionMode(str(raw.get("execution_mode", ExecutionMode.DRY_RUN))),
             status=RuleStatus(str(raw.get("status", RuleStatus.ACTIVE))),
+            live_status=LiveEnablementStatus(
+                str(raw.get("live_status", LiveEnablementStatus.DRY_RUN))
+            ),
             attached_order_id=raw.get("attached_order_id"),
         )
 

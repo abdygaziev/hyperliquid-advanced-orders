@@ -16,9 +16,18 @@ from .hyperliquid_client import (
     HyperliquidExchangeGateway,
     HyperliquidMarketDataGateway,
 )
-from .models import ExecutionMode, PositionSide, RuleStatus, TrailMode, TrailingStopRule
+from .models import (
+    ExecutionMode,
+    LiveEnablementStatus,
+    PositionSide,
+    RuleStatus,
+    TrailMode,
+    TrailingStopRule,
+)
+from .preflight import PreflightService
 from .readiness import ReadinessChecker, ReadinessContext
-from .secrets import InMemorySecrets, KeychainSecrets, SecretStore
+from .recovery import diagnostics_payload, manual_review_rule_ids, reset_triggered_rule, validate_state
+from .secrets import KeychainSecrets, SecretStore
 from .storage import LocalStateStore
 from .submission import SubmissionPolicy
 
@@ -35,12 +44,6 @@ app.add_typer(secret_app, name="secret")
 class LiveRunSetup(NamedTuple):
     submission_policy: SubmissionPolicy | None
     readiness_context_factory: ReadinessContextFactory | None
-
-
-class MarketVerification(NamedTuple):
-    exists: bool
-    source: str
-    error: str | None = None
 
 
 class LazyHyperliquidExchangeGateway:
@@ -67,6 +70,16 @@ class LazyHyperliquidExchangeGateway:
                 base_url=self.base_url,
             )
         return self.gateway.submit_market_close(coin, size)
+
+    def schedule_cancel(self, time_ms: int | None) -> dict[str, Any]:
+        if self.gateway is None:
+            self.gateway = HyperliquidExchangeGateway.from_keychain(
+                account=self.account,
+                wallet_address=self.wallet_address,
+                secrets=self.secrets,
+                base_url=self.base_url,
+            )
+        return self.gateway.schedule_cancel(time_ms)
 
 
 def default_data_dir() -> Path:
@@ -116,17 +129,17 @@ def init(ctx: typer.Context) -> None:
 def run(
     ctx: typer.Context,
     once: bool = typer.Option(False, "--once", help="Run one bounded daemon tick."),
-    interval_seconds: float = typer.Option(
+    poll_interval_seconds: float = typer.Option(
         5.0,
+        "--poll-interval-seconds",
         "--interval-seconds",
-        min=0.001,
-        help="Seconds between daemon ticks when running continuously.",
+        help="Seconds between daemon ticks in continuous mode.",
     ),
-    max_ticks: int | None = typer.Option(
+    max_iterations: int | None = typer.Option(
         None,
+        "--max-iterations",
         "--max-ticks",
-        min=1,
-        help="Stop after this many ticks; useful for smoke tests.",
+        help="Stop after this many ticks; primarily useful for supervised smoke tests.",
     ),
     account_address: str | None = typer.Option(
         None,
@@ -148,6 +161,11 @@ def run(
         "--confirmation-phrase",
         help="Mainnet auto-submit confirmation phrase.",
     ),
+    canary: bool = typer.Option(
+        False,
+        "--canary",
+        help="Run pending live rules as canary submissions before normal live promotion.",
+    ),
     market_exists: bool = typer.Option(
         False,
         "--market-exists",
@@ -155,6 +173,10 @@ def run(
     ),
     base_url: str | None = typer.Option(None, "--base-url", help="Optional Hyperliquid API URL."),
 ) -> None:
+    if poll_interval_seconds <= 0:
+        raise typer.BadParameter("--poll-interval-seconds must be positive")
+    if max_iterations is not None and max_iterations <= 0:
+        raise typer.BadParameter("--max-iterations must be positive")
     if account_address is None:
         raise typer.BadParameter("--account-address is required")
     store = state_store(ctx)
@@ -165,6 +187,7 @@ def run(
         for rule in state.rules.values()
     )
     market_data = HyperliquidMarketDataGateway(base_url=base_url)
+    account = HyperliquidAccountGateway(info=market_data.info, address=account_address)
     live_setup = configure_live_run(
         ctx=ctx,
         audit=audit,
@@ -172,11 +195,12 @@ def run(
         keychain_account=keychain_account,
         wallet_address=wallet_address,
         confirmation_phrase=confirmation_phrase,
-        manual_market_exists=market_exists,
-        market_data=market_data,
+        market_exists=market_exists,
         base_url=base_url,
+        market_data=market_data,
+        account=account,
+        canary_mode=canary,
     )
-    account = HyperliquidAccountGateway(info=market_data.info, address=account_address)
     daemon = DaemonService(
         store=store,
         audit=audit,
@@ -188,15 +212,35 @@ def run(
     if once:
         daemon.run_once()
         typer.echo("Completed one daemon tick.")
+        if canary:
+            typer.echo(f"Canary mode target={base_url or 'default-mainnet'}")
         return
-
-    ticks = DaemonRunner(
+    iterations = DaemonRunner(
         daemon=daemon,
+        store=store,
         audit=audit,
-        interval_seconds=interval_seconds,
-        max_ticks=max_ticks,
+        poll_interval_seconds=poll_interval_seconds,
+        max_iterations=max_iterations,
     ).run()
-    typer.echo(f"Daemon stopped after {ticks} tick{'s' if ticks != 1 else ''}.")
+    typer.echo(f"Daemon stopped after {iterations} tick{'s' if iterations != 1 else ''}.")
+    if canary:
+        typer.echo(f"Canary mode target={base_url or 'default-mainnet'}")
+
+
+@app.command()
+def health(ctx: typer.Context) -> None:
+    state = state_store(ctx).load()
+    health_state = state.health
+    typer.echo(f"mode={health_state.mode}")
+    typer.echo(f"active_rules={health_state.active_rules_count}")
+    typer.echo(f"last_tick_started_at={health_state.last_tick_started_at}")
+    typer.echo(f"last_tick_completed_at={health_state.last_tick_completed_at}")
+    typer.echo(f"last_successful_account_snapshot_at={health_state.last_successful_account_snapshot_at}")
+    typer.echo(f"last_successful_market_snapshot_at={health_state.last_successful_market_snapshot_at}")
+    typer.echo(f"consecutive_failures={health_state.consecutive_failures}")
+    typer.echo(f"active_error={health_state.active_error}")
+    if health_state.last_blocked_reasons:
+        typer.echo("last_blocked_reasons=" + "; ".join(health_state.last_blocked_reasons))
 
 
 @rule_app.command("create-trailing")
@@ -245,11 +289,15 @@ def create_trailing_rule(
                 "trail_mode": rule.trail_mode.value,
                 "trail_value": str(rule.trail_value),
                 "execution_mode": rule.execution_mode.value,
+                "live_status": rule.live_status.value,
                 "attached_order_id": rule.attached_order_id,
             },
         )
     )
-    typer.echo(f"Created {rule.id} for {rule.coin} {rule.side.value} in {rule.execution_mode.value}")
+    typer.echo(
+        f"Created {rule.id} for {rule.coin} {rule.side.value} "
+        f"in {rule.execution_mode.value} live_status={rule.live_status.value}"
+    )
 
 
 @rule_app.command("list")
@@ -268,6 +316,7 @@ def list_rules(ctx: typer.Context) -> None:
                     rule.side.value,
                     rule.execution_mode.value,
                     rule.status.value,
+                    f"live_status={rule.live_status.value}",
                     f"size={rule.size}",
                     f"protected={runtime.protected_size}",
                     f"triggered={runtime.triggered}",
@@ -291,6 +340,104 @@ def disable_rule(ctx: typer.Context, rule_id: str) -> None:
     typer.echo(f"Disabled {rule_id}")
 
 
+@rule_app.command("promote-live")
+def promote_rule_live(ctx: typer.Context, rule_id: str) -> None:
+    store = state_store(ctx)
+    state = store.load()
+    rule = require_rule(state.rules, rule_id)
+    if rule.live_status != LiveEnablementStatus.CANARY_SUCCEEDED:
+        raise typer.BadParameter("rule must have canary_succeeded live_status before promotion")
+    promoted = replace(rule, live_status=LiveEnablementStatus.NORMAL_LIVE)
+    state.rules[rule_id] = promoted
+    state.rule_states[rule_id].rule = promoted
+    store.save(state)
+    audit_log(ctx).append(
+        AuditEvent.create(
+            "rule_live_promoted",
+            "Promoted rule to normal live auto_submit.",
+            rule_id=rule_id,
+            payload={"live_status": promoted.live_status.value},
+        )
+    )
+    typer.echo(f"Promoted {rule_id} to normal_live")
+
+
+@rule_app.command("manual-review")
+def list_manual_review_rules(ctx: typer.Context) -> None:
+    rule_ids = manual_review_rule_ids(state_store(ctx))
+    if not rule_ids:
+        typer.echo("No manual-review rules.")
+        return
+    for rule_id in rule_ids:
+        typer.echo(rule_id)
+
+
+@rule_app.command("reset-triggered")
+def reset_triggered(
+    ctx: typer.Context,
+    rule_id: str,
+    reason: str = typer.Option(..., "--reason", help="Operator reason for the reset."),
+    account_address: str = typer.Option(..., "--account-address", help="Hyperliquid wallet address."),
+    base_url: str | None = typer.Option(None, "--base-url", help="Optional Hyperliquid API URL."),
+) -> None:
+    market_data = HyperliquidMarketDataGateway(base_url=base_url)
+    account = HyperliquidAccountGateway(info=market_data.info, address=account_address)
+    try:
+        reset_triggered_rule(
+            store=state_store(ctx),
+            audit=audit_log(ctx),
+            account=account,
+            rule_id=rule_id,
+            reason=reason,
+        )
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    typer.echo(f"Reset {rule_id}")
+
+
+@app.command("state-validate")
+def state_validate(ctx: typer.Context) -> None:
+    valid, message = validate_state(state_store(ctx))
+    typer.echo(message)
+    if not valid:
+        raise typer.Exit(1)
+
+
+@app.command("diagnostics")
+def diagnostics(ctx: typer.Context) -> None:
+    payload = diagnostics_payload(state_store(ctx), data_dir(ctx) / "audit.jsonl")
+    typer.echo(json.dumps(payload, sort_keys=True, indent=2))
+
+
+@app.command("emergency-cancel")
+def emergency_cancel(
+    ctx: typer.Context,
+    keychain_account: str = typer.Option(..., "--keychain-account", help="Keychain account name."),
+    wallet_address: str = typer.Option(..., "--wallet-address", help="Hyperliquid wallet address."),
+    time_ms: int | None = typer.Option(
+        None,
+        "--time-ms",
+        help="UTC millis for scheduled cancel; omit to cancel a pending schedule.",
+    ),
+    base_url: str | None = typer.Option(None, "--base-url", help="Optional Hyperliquid API URL."),
+) -> None:
+    gateway = LazyHyperliquidExchangeGateway(
+        account=keychain_account,
+        wallet_address=wallet_address,
+        secrets=KeychainSecrets(),
+        base_url=base_url,
+    )
+    response = gateway.schedule_cancel(time_ms)
+    audit_log(ctx).append(
+        AuditEvent.create(
+            "emergency_cancel_scheduled",
+            "Operator invoked exchange emergency cancel.",
+            payload={"time_ms": time_ms, "exchange_response": response},
+        )
+    )
+    typer.echo("Emergency cancel request submitted.")
+
+
 @app.command()
 def readiness(
     ctx: typer.Context,
@@ -308,17 +455,15 @@ def readiness(
     rule = require_rule(state.rules, rule_id)
     checker = ReadinessChecker(KeychainSecrets())
     market_data = HyperliquidMarketDataGateway(base_url=base_url)
+    market_metadata = market_data.get_market_metadata(rule.coin)
     context = build_readiness_context(
         ctx=ctx,
         state=state,
         rule=rule,
         account=account,
-        market_verification=verify_rule_market(
-            market_data=market_data,
-            coin=rule.coin,
-            manual_market_exists=market_exists,
-        ),
+        market_exists=bool(market_metadata.exists),
         confirmation_phrase=confirmation_phrase,
+        market_verification=str(market_metadata.source),
     )
     result = checker.check_mainnet_auto_submit(rule, context)
     audit_log(ctx).append(
@@ -330,7 +475,7 @@ def readiness(
                 "passed": result.passed,
                 "reasons": result.reasons,
                 "market_verification": context.market_verification,
-                "market_verification_error": context.market_verification_error,
+                "manual_market_hint_ignored": market_exists,
             },
         )
     )
@@ -341,6 +486,55 @@ def readiness(
     for reason in result.reasons:
         typer.echo(reason)
     raise typer.Exit(1)
+
+
+@app.command()
+def preflight(
+    ctx: typer.Context,
+    account: str = typer.Option(..., help="Keychain account name."),
+    account_address: str | None = typer.Option(
+        None,
+        "--account-address",
+        help="Hyperliquid wallet address for account snapshot validation.",
+    ),
+    confirmation_phrase: str = typer.Option("", help="Mainnet auto-submit confirmation phrase."),
+    base_url: str | None = typer.Option(None, "--base-url", help="Optional Hyperliquid API URL."),
+) -> None:
+    typer.echo("preflight: read-only; no orders will be submitted")
+    state = state_store(ctx).load()
+    if not state.rules:
+        typer.echo("No rules.")
+        return
+    market_data = HyperliquidMarketDataGateway(base_url=base_url)
+    account_gateway = (
+        HyperliquidAccountGateway(info=market_data.info, address=account_address)
+        if account_address is not None
+        else None
+    )
+    service = PreflightService(
+        secrets=KeychainSecrets(),
+        market_data=market_data,
+        account=account_gateway,
+    )
+    failed = False
+    for rule in state.rules.values():
+        result = service.check_rule(
+            state=state,
+            rule=rule,
+            account_name=account,
+            dry_run_events_count=count_rule_events(ctx, rule.id, "dry_run_exit"),
+            confirmation_phrase=confirmation_phrase,
+        )
+        status = "ready" if result.passed else "blocked"
+        typer.echo(
+            f"{rule.id} {rule.coin} {status} market_source={result.market_metadata_source} "
+            f"mark_observed_at={result.mark_observed_at}"
+        )
+        for reason in result.reasons:
+            typer.echo(f"{rule.id}: {reason}")
+        failed = failed or not result.passed
+    if failed:
+        raise typer.Exit(1)
 
 
 @app.command("kill-switch")
@@ -362,112 +556,6 @@ def kill_switch(
         )
     )
     typer.echo(f"Kill switch {'enabled' if enable else 'disabled'}.")
-
-
-@app.command()
-def preflight(
-    ctx: typer.Context,
-    coin: str | None = typer.Option(
-        None,
-        "--coin",
-        help="Optional Hyperliquid market to verify without submitting orders.",
-    ),
-    rule_id: str | None = typer.Option(
-        None,
-        "--rule-id",
-        help="Optional local rule to include in readiness preflight.",
-    ),
-    account_address: str | None = typer.Option(
-        None,
-        "--account-address",
-        help="Optional wallet address for read-only account snapshot checks.",
-    ),
-    keychain_account: str | None = typer.Option(
-        None,
-        "--keychain-account",
-        help="Optional Keychain account name for readiness reporting.",
-    ),
-    verify_keychain: bool = typer.Option(
-        False,
-        "--verify-keychain",
-        help="Actually check macOS Keychain key presence during preflight.",
-    ),
-    confirmation_phrase: str = typer.Option(
-        "",
-        "--confirmation-phrase",
-        help="Optional phrase to include in readiness reporting.",
-    ),
-    base_url: str | None = typer.Option(None, "--base-url", help="Optional Hyperliquid API URL."),
-) -> None:
-    typer.echo("preflight: read-only; no orders will be submitted")
-    typer.echo(f"state directory: {data_dir(ctx)}")
-    typer.echo(f"base url: {base_url or 'default'}")
-    typer.echo("entrypoint: ok")
-
-    store = state_store(ctx)
-    state = store.load()
-    rule = require_rule(state.rules, rule_id) if rule_id is not None else None
-    if rule is not None and coin is not None and coin.upper() != rule.coin:
-        raise typer.BadParameter("--coin must match the selected rule coin")
-    target_coin = (coin or (rule.coin if rule is not None else "")).upper()
-    market_data = HyperliquidMarketDataGateway(base_url=base_url)
-
-    market_verification = MarketVerification(False, "not_checked")
-    if target_coin:
-        market_verification = verify_rule_market(
-            market_data=market_data,
-            coin=target_coin,
-            manual_market_exists=False,
-        )
-        typer.echo(f"market {target_coin}: {market_verification.source}")
-        if market_verification.error is not None:
-            typer.echo(f"market error: {market_verification.error}")
-        try:
-            tick = market_data.get_mark_price(target_coin)
-            typer.echo(f"price {target_coin}: {tick.source.value} {tick.mark_price}")
-        except Exception as exc:
-            typer.echo(f"price {target_coin}: unavailable ({exc})")
-
-    if account_address is not None:
-        account = HyperliquidAccountGateway(info=market_data.info, address=account_address)
-        try:
-            positions = account.get_positions()
-            fills = account.get_fills()
-            typer.echo(f"account snapshot: positions={len(positions)} fills={len(fills)}")
-        except Exception as exc:
-            typer.echo(f"account snapshot: unavailable ({exc})")
-
-    if rule is not None:
-        secrets = KeychainSecrets() if verify_keychain else InMemorySecrets()
-        checker = ReadinessChecker(secrets)
-        context = build_readiness_context(
-            ctx=ctx,
-            state=state,
-            rule=rule,
-            account=keychain_account or "",
-            market_verification=market_verification,
-            confirmation_phrase=confirmation_phrase,
-        )
-        result = checker.check_mainnet_auto_submit(rule, context)
-        audit_log(ctx).append(
-            AuditEvent.create(
-                "preflight_checked",
-                "Ran read-only preflight.",
-                rule_id=rule.id,
-                payload={
-                    "passed": result.passed,
-                    "reasons": result.reasons,
-                    "market_verification": context.market_verification,
-                    "read_only": True,
-                    "keychain_checked": verify_keychain,
-                },
-            )
-        )
-        typer.echo(f"readiness: {'passed' if result.passed else 'blocked'}")
-        for reason in result.reasons:
-            typer.echo(reason)
-    elif keychain_account is not None and not verify_keychain:
-        typer.echo("keychain: not checked; pass --verify-keychain to check local key presence")
 
 
 @secret_app.command("store-key")
@@ -511,9 +599,11 @@ def configure_live_run(
     keychain_account: str | None,
     wallet_address: str | None,
     confirmation_phrase: str,
-    manual_market_exists: bool,
-    market_data: Any,
+    market_exists: bool,
     base_url: str | None,
+    market_data: Any,
+    account: Any,
+    canary_mode: bool,
 ) -> LiveRunSetup:
     if not has_auto_submit:
         return LiveRunSetup(None, None)
@@ -538,21 +628,21 @@ def configure_live_run(
         audit=audit,
         exchange=exchange,
         readiness_checker=checker,
+        canary_mode=canary_mode,
     )
 
     def readiness_context_factory(current_state, rule: TrailingStopRule) -> ReadinessContext:
-        return build_readiness_context(
-            ctx=ctx,
+        return PreflightService(
+            secrets=secrets,
+            market_data=market_data,
+            account=account,
+        ).check_rule(
             state=current_state,
             rule=rule,
-            account=keychain_account,
-            market_verification=verify_rule_market(
-                market_data=market_data,
-                coin=rule.coin,
-                manual_market_exists=manual_market_exists,
-            ),
+            account_name=keychain_account,
+            dry_run_events_count=count_rule_events(ctx, rule.id, "dry_run_exit"),
             confirmation_phrase=confirmation_phrase,
-        )
+        ).context
 
     return LiveRunSetup(submission_policy, readiness_context_factory)
 
@@ -572,9 +662,7 @@ def require_live_run_options(
         missing_options.append("--confirmation-phrase")
     if missing_options:
         raise typer.BadParameter(
-            "auto_submit rules require "
-            + ", ".join(missing_options)
-            + " for live daemon runs"
+            "auto_submit rules require " + ", ".join(missing_options) + " with --once"
         )
 
 
@@ -584,40 +672,20 @@ def build_readiness_context(
     state: Any,
     rule: TrailingStopRule,
     account: str,
-    market_verification: MarketVerification,
+    market_exists: bool,
     confirmation_phrase: str,
+    market_verification: str = "unknown",
 ) -> ReadinessContext:
     return ReadinessContext(
         account=account,
-        market_exists=market_verification.exists,
+        market_exists=market_exists,
         observed_live_mark_price=rule.id in state.live_mark_observed_rule_ids,
         kill_switch_available=True,
         kill_switch_active=state.kill_switch_active,
         dry_run_events_count=count_rule_events(ctx, rule.id, "dry_run_exit"),
         confirmation_phrase=confirmation_phrase,
-        market_verification=market_verification.source,
-        market_verification_error=market_verification.error,
+        market_verification=market_verification,
     )
-
-
-def verify_rule_market(
-    *,
-    market_data: Any,
-    coin: str,
-    manual_market_exists: bool,
-) -> MarketVerification:
-    try:
-        if market_data.market_exists(coin):
-            return MarketVerification(True, "hyperliquid_metadata")
-        return MarketVerification(False, "hyperliquid_metadata")
-    except Exception as exc:
-        if manual_market_exists:
-            return MarketVerification(
-                False,
-                "manual_hint_ignored_after_metadata_failure",
-                str(exc),
-            )
-        return MarketVerification(False, "hyperliquid_metadata_unavailable", str(exc))
 
 
 def require_rule(rules: dict[str, TrailingStopRule], rule_id: str) -> TrailingStopRule:

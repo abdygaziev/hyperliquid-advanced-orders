@@ -47,10 +47,15 @@ class FakeInfo:
 class FakeExchange:
     def __init__(self) -> None:
         self.calls: list[tuple[str, Decimal]] = []
+        self.cancel_calls: list[int | None] = []
 
     def market_close(self, coin: str, sz: Decimal) -> dict[str, object]:
         self.calls.append((coin, sz))
         return {"status": "ok", "coin": coin, "sz": str(sz)}
+
+    def schedule_cancel(self, time: int | None) -> dict[str, object]:
+        self.cancel_calls.append(time)
+        return {"status": "ok", "time": time}
 
 
 class HyperliquidGatewayTest(unittest.TestCase):
@@ -69,6 +74,24 @@ class HyperliquidGatewayTest(unittest.TestCase):
         self.assertEqual(tick.coin, "ETH")
         self.assertEqual(tick.mark_price, Decimal("2451.25"))
         self.assertEqual(tick.source, PriceSource.MARK)
+
+    def test_market_metadata_reports_coin_existence_from_meta_payload(self) -> None:
+        class MarkInfo(FakeInfo):
+            def meta_and_asset_ctxs(self):
+                return (
+                    {"universe": [{"name": "ETH"}]},
+                    [{"markPx": "2451.25"}],
+                )
+
+        gateway = HyperliquidMarketDataGateway(info=MarkInfo())
+
+        eth_metadata = gateway.get_market_metadata("eth")
+        btc_metadata = gateway.get_market_metadata("btc")
+
+        self.assertTrue(eth_metadata.exists)
+        self.assertEqual(eth_metadata.coin, "ETH")
+        self.assertEqual(eth_metadata.source, "meta_and_asset_ctxs")
+        self.assertFalse(btc_metadata.exists)
 
     def test_all_mids_payload_is_labeled_mid_price_fallback(self) -> None:
         gateway = HyperliquidMarketDataGateway(info=FakeInfo())
@@ -126,6 +149,15 @@ class HyperliquidGatewayTest(unittest.TestCase):
         response = gateway.submit_market_close("ETH", Decimal("0.4"))
 
         self.assertEqual(exchange.calls, [("ETH", Decimal("0.4"))])
+        self.assertEqual(response["status"], "ok")
+
+    def test_schedule_cancel_uses_exchange_gateway_explicitly(self) -> None:
+        exchange = FakeExchange()
+        gateway = HyperliquidExchangeGateway(exchange=exchange)
+
+        response = gateway.schedule_cancel(123456)
+
+        self.assertEqual(exchange.cancel_calls, [123456])
         self.assertEqual(response["status"], "ok")
 
 

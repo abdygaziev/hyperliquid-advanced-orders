@@ -11,35 +11,82 @@ from hl_advanced_orders.readiness import MAINNET_CONFIRMATION_PHRASE
 
 class DocumentationExamplesTest(unittest.TestCase):
     def setUp(self) -> None:
-        self.readme = Path("README.md").read_text(encoding="utf-8")
         self.runner = CliRunner()
 
     def test_readme_preserves_test_command_and_confirmation_phrase(self) -> None:
-        self.assertIn("python -m unittest discover -s tests", self.readme)
-        self.assertIn(MAINNET_CONFIRMATION_PHRASE, self.readme)
-        self.assertIn("dry-run/private-pilot", self.readme)
+        readme = Path("README.md").read_text(encoding="utf-8")
+
+        self.assertIn("python -m unittest discover -s tests", readme)
+        self.assertIn(MAINNET_CONFIRMATION_PHRASE, readme)
+        self.assertIn("dry-run/private-pilot", readme)
 
     def test_readme_routes_through_preflight_before_mainnet_automation(self) -> None:
-        preflight_index = self.readme.index("hl-advanced-orders preflight")
-        auto_submit_index = self.readme.index("--execution-mode auto_submit")
+        readme = Path("README.md").read_text(encoding="utf-8")
+        preflight_index = readme.index("hl-advanced-orders preflight")
+        auto_submit_index = readme.index("--execution-mode auto_submit")
 
         self.assertLess(preflight_index, auto_submit_index)
-        self.assertIn("read-only preflight", self.readme)
-        self.assertIn("submitting orders", self.readme)
-        self.assertNotIn("Pass `--market-exists`", self.readme)
+        self.assertIn("read-only preflight", readme)
+        self.assertIn("submitting orders", readme)
+        self.assertNotIn("Pass `--market-exists`", readme)
 
-    def test_documented_top_level_commands_exist(self) -> None:
-        result = self.runner.invoke(app, ["--help"])
+    def test_readme_references_existing_top_level_commands(self) -> None:
+        readme = Path("README.md").read_text(encoding="utf-8")
+        help_result = self.runner.invoke(app, ["--help"])
 
-        self.assertEqual(result.exit_code, 0, result.output)
-        for command in ["init", "run", "readiness", "kill-switch", "preflight"]:
-            self.assertIn(command, result.output)
+        for command in [
+            "init",
+            "run",
+            "health",
+            "state-validate",
+            "diagnostics",
+            "emergency-cancel",
+            "preflight",
+            "kill-switch",
+        ]:
+            self.assertIn(f"hl-advanced-orders {command}", readme)
+            self.assertIn(command, help_result.output)
 
-    def test_preflight_help_documents_no_order_submission(self) -> None:
-        result = self.runner.invoke(app, ["preflight", "--help"])
+    def test_readme_references_existing_rule_commands_and_confirmation_phrase(self) -> None:
+        readme = Path("README.md").read_text(encoding="utf-8")
+        help_result = self.runner.invoke(app, ["rule", "--help"])
 
-        self.assertEqual(result.exit_code, 0, result.output)
-        self.assertIn("without submitting orders", result.output)
+        for command in [
+            "create-trailing",
+            "promote-live",
+            "manual-review",
+            "reset-triggered",
+            "disable",
+        ]:
+            self.assertIn(f"hl-advanced-orders rule {command}", readme)
+            self.assertIn(command, help_result.output)
+        self.assertIn("ENABLE MAINNET AUTO SUBMIT", readme)
+
+    def test_runbook_covers_operator_workflow(self) -> None:
+        runbook = Path("docs/runbooks/trader-readiness.md").read_text(encoding="utf-8")
+
+        for phrase in [
+            "Dry-Run Burn-In",
+            "Preflight",
+            "Canary",
+            "Normal Live",
+            "Kill Switch",
+            "Recovery",
+            "Emergency Cancel",
+            "macOS Launch",
+            "official Hyperliquid docs",
+        ]:
+            self.assertIn(phrase, runbook)
+
+    def test_launchd_template_uses_placeholders_and_no_private_key(self) -> None:
+        plist = Path("packaging/launchd/com.hyperliquid-advanced-orders.plist").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn("0xREPLACE_WITH_ACCOUNT_ADDRESS", plist)
+        self.assertIn("0xREPLACE_WITH_WALLET_ADDRESS", plist)
+        self.assertNotIn("private-key", plist.lower())
+        self.assertNotIn("secret", plist.lower())
 
 
 if __name__ == "__main__":

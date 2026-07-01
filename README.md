@@ -1,30 +1,30 @@
 # Hyperliquid Advanced Orders
 
-CLI-first local daemon for Hyperliquid advanced order automation.
+CLI-first local daemon for Hyperliquid trailing-stop automation.
 
-The MVP focuses on trailing stops for long and short positions:
+The app is local-first:
 
-- percent trailing stops
-- absolute-value trailing stops
-- moving-average trailing stops
-- mark-price tracking
+- percent, absolute-value, and moving-average trailing stops
+- mark-price tracking with mid-price fallback blocked from live readiness
 - dry-run by default
 - per-rule `auto_submit`
-- macOS Keychain for local secrets
-- audit log for simulated and live actions
+- canary-before-normal-live workflow
+- macOS Keychain for local signing keys
+- kill switch, health, diagnostics, and audit logs
 
-This project is intentionally local-first. It does not use hosted custody or cloud signing.
+It does not use hosted custody or cloud signing.
 
 ## Status
 
-Local trailing-stop rule persistence, deterministic daemon ticks, readiness checks, audit events,
-and read-only preflight checks are implemented. This is suitable for dry-run/private-pilot use.
+The local daemon can persist rules, run bounded or continuous ticks, evaluate mark prices and fills, record dry-run exits, gate live submissions through readiness and canary state, and expose operator health/recovery commands.
+This is suitable for dry-run/private-pilot use with read-only preflight checks before any mainnet automation.
+Live Hyperliquid access is isolated behind gateway interfaces so normal tests run without network access or Keychain access.
 
-Do not treat this as live automated order protection until the preflight workflow, dry-run evidence,
-Keychain setup, verified market metadata, live mark-price observation, inactive kill switch, and
-exact mainnet confirmation phrase all pass for the rule you intend to automate. Live Hyperliquid
-access is isolated behind gateway interfaces so normal tests run without network access or Keychain
-access.
+Do not treat this as unattended live order protection until the preflight workflow, dry-run evidence,
+Keychain setup, metadata-backed market verification, fresh live mark-price observation, inactive kill
+switch, canary workflow, and exact mainnet confirmation phrase all pass. Before unattended live use,
+recheck official Hyperliquid docs for exchange submission, mark-price/websocket behavior, rate limits,
+and reduce-only close behavior from an environment that can access the GitBook docs.
 
 ## Development
 
@@ -33,6 +33,7 @@ python3 -m venv .venv
 source .venv/bin/activate
 pip install -e ".[dev]"
 python -m unittest discover -s tests
+ruff check .
 hl-advanced-orders --help
 python -m hl_advanced_orders.cli --help
 ```
@@ -40,15 +41,14 @@ python -m hl_advanced_orders.cli --help
 ## Safety Model
 
 Every rule starts in `dry_run`.
-Mainnet `auto_submit` must pass readiness checks and require a typed confirmation phrase before the daemon can submit live orders.
-The exact phrase is:
+Mainnet `auto_submit` remains blocked unless readiness passes: Keychain key present, metadata-backed market exists, fresh live mark price observed, kill switch inactive, prior dry-run audit evidence exists, canary evidence exists for normal live, and the exact phrase is supplied.
 
 ```text
 ENABLE MAINNET AUTO SUBMIT
 ```
 
-The kill switch blocks automated live submissions while preserving local inspection and audit
-review.
+The kill switch blocks automated live submissions while preserving inspection, diagnostics, and audit review.
+Failed or ambiguous live submissions move rules toward manual review instead of retrying repeatedly.
 
 ## Local Workflow
 
@@ -58,8 +58,7 @@ Initialize local state:
 hl-advanced-orders init
 ```
 
-Store a signing key in macOS Keychain. The private key is prompted without echo and is not written
-to state or audit files:
+Store a signing key in macOS Keychain. The private key is prompted without echo and is not written to state or audit files:
 
 ```bash
 hl-advanced-orders secret store-key --account trader-main
@@ -89,15 +88,41 @@ hl-advanced-orders rule create-trailing \
   --attached-order-id 123456
 ```
 
-Inspect local rules and readiness:
+Run one bounded dry-run tick:
+
+```bash
+hl-advanced-orders run --once --account-address 0xabc...
+```
+
+Run continuously in the foreground:
+
+```bash
+hl-advanced-orders run \
+  --account-address 0xabc... \
+  --poll-interval-seconds 5
+```
+
+Inspect state and health:
 
 ```bash
 hl-advanced-orders rule list
-hl-advanced-orders readiness rule_abc123 --account trader-main
+hl-advanced-orders health
+hl-advanced-orders state-validate
+hl-advanced-orders diagnostics
 ```
 
-Readiness verifies market existence through Hyperliquid metadata. A mid-price fallback is useful for
-inspection, but only mark-price observations count as live readiness evidence for `auto_submit`.
+Run read-only preflight before considering mainnet automation. This checks readiness without
+submitting orders:
+
+```bash
+hl-advanced-orders preflight \
+  --account trader-main \
+  --account-address 0xabc... \
+  --base-url https://api.hyperliquid-testnet.xyz
+```
+
+Hyperliquid applies API rate limits. Keep polling intervals conservative; the daemon defaults are
+intended for local MVP use, not high-frequency execution.
 
 Enable or disable the kill switch:
 
@@ -106,36 +131,7 @@ hl-advanced-orders kill-switch --enable
 hl-advanced-orders kill-switch --disable
 ```
 
-Run a bounded local daemon check:
-
-```bash
-hl-advanced-orders run --once --account-address 0xabc...
-```
-
-Run the local daemon loop. Start with `--max-ticks` while validating behavior, then omit it when you
-are ready for a continuous local process:
-
-```bash
-hl-advanced-orders run --account-address 0xabc... --max-ticks 3
-```
-
-Run a read-only preflight before considering mainnet automation. This checks CLI wiring, state,
-market metadata, mark-price source, optional account snapshot access, and readiness blockers without
-submitting orders:
-
-```bash
-hl-advanced-orders preflight \
-  --rule-id rule_abc123 \
-  --account-address 0xabc... \
-  --keychain-account trader-main \
-  --base-url https://api.hyperliquid-testnet.xyz
-```
-
-Hyperliquid applies API rate limits. Keep polling intervals conservative; the daemon defaults are
-intended for local MVP use, not high-frequency execution. Future websocket-fed market data can reduce
-polling pressure, but the MVP safety path does not require it.
-
-`auto_submit` rules are still created deliberately per rule:
+Create an `auto_submit` rule. It starts as `canary_pending`, not normal live:
 
 ```bash
 hl-advanced-orders rule create-trailing \
@@ -147,6 +143,41 @@ hl-advanced-orders rule create-trailing \
   --execution-mode auto_submit
 ```
 
-Live submission remains blocked unless readiness passes: Keychain key present, market exists, live
-mark price observed, kill switch inactive, prior dry-run audit evidence exists, and the exact
-confirmation phrase is supplied.
+Run a canary submission only after dry-run evidence and preflight readiness exist:
+
+```bash
+hl-advanced-orders run \
+  --once \
+  --account-address 0xabc... \
+  --keychain-account trader-main \
+  --wallet-address 0xabc... \
+  --confirmation-phrase "ENABLE MAINNET AUTO SUBMIT" \
+  --canary
+```
+
+Promote only after canary success:
+
+```bash
+hl-advanced-orders rule promote-live rule_abc123
+```
+
+Inspect and recover manual-review rules:
+
+```bash
+hl-advanced-orders rule manual-review
+hl-advanced-orders rule reset-triggered rule_abc123 \
+  --reason "operator reviewed exchange fill" \
+  --account-address 0xabc...
+hl-advanced-orders rule disable rule_abc123
+```
+
+Emergency cancel is an explicit operator action, not automatic daemon behavior:
+
+```bash
+hl-advanced-orders emergency-cancel \
+  --keychain-account trader-main \
+  --wallet-address 0xabc... \
+  --time-ms 1782875108000
+```
+
+See `docs/runbooks/trader-readiness.md` for the full dry-run-to-live runbook and macOS launch guidance.
