@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.hyperliquid-advanced-orders</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/ABSOLUTE/PATH/TO/.venv/bin/hl-advanced-orders</string>
+    <string>run</string>
+    <string>--account-address</string>
+    <string>0xREPLACE_WITH_ACCOUNT_ADDRESS</string>
+    <string>--keychain-account</string>
+    <string>trader-main</string>
+    <string>--wallet-address</string>
+    <string>0xREPLACE_WITH_WALLET_ADDRESS</string>
+    <string>--confirmation-phrase</string>
+    <string>ENABLE MAINNET AUTO SUBMIT</string>
+    <string>--poll-interval-seconds</string>
+    <string>5</string>
+  </array>
+
+  <key>RunAtLoad</key>
+  <true/>
+
+  <key>KeepAlive</key>
+  <false/>
+
+  <key>StandardOutPath</key>
+  <string>/tmp/hyperliquid-advanced-orders.out.log</string>
+
+  <key>StandardErrorPath</key>
+  <string>/tmp/hyperliquid-advanced-orders.err.log</string>
+</dict>
+</plist>

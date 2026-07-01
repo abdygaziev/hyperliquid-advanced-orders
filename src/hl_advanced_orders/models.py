@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from decimal import Decimal
 from enum import StrEnum
@@ -39,6 +39,14 @@ class RuleStatus(StrEnum):
     DISABLED = "disabled"
 
 
+class LiveEnablementStatus(StrEnum):
+    DRY_RUN = "dry_run"
+    CANARY_PENDING = "canary_pending"
+    CANARY_SUCCEEDED = "canary_succeeded"
+    NORMAL_LIVE = "normal_live"
+    MANUAL_REVIEW = "manual_review"
+
+
 @dataclass(frozen=True)
 class TrailingStopRule:
     coin: str
@@ -49,12 +57,20 @@ class TrailingStopRule:
     exit_order_type: ExitOrderType = ExitOrderType.MARKET
     execution_mode: ExecutionMode = ExecutionMode.DRY_RUN
     status: RuleStatus = RuleStatus.ACTIVE
+    live_status: LiveEnablementStatus = LiveEnablementStatus.DRY_RUN
     attached_order_id: str | None = None
     id: str = ""
 
     def __post_init__(self) -> None:
         if not self.id:
             object.__setattr__(self, "id", f"rule_{uuid4().hex[:12]}")
+        if (
+            self.execution_mode == ExecutionMode.AUTO_SUBMIT
+            and self.live_status == LiveEnablementStatus.DRY_RUN
+        ):
+            object.__setattr__(self, "live_status", LiveEnablementStatus.CANARY_PENDING)
+        if self.execution_mode == ExecutionMode.DRY_RUN:
+            object.__setattr__(self, "live_status", LiveEnablementStatus.DRY_RUN)
         if self.size <= 0:
             raise ValueError("size must be positive")
         if self.trail_value <= 0:
@@ -96,3 +112,4 @@ class TriggeredExit:
     stop_price: Decimal
     execution_mode: ExecutionMode
     exit_order_type: ExitOrderType
+    mark_observed_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))

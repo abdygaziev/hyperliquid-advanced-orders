@@ -11,6 +11,7 @@ from hl_advanced_orders.daemon import DaemonService
 from hl_advanced_orders.hyperliquid_client import FillEvent, PositionSnapshot
 from hl_advanced_orders.models import (
     ExecutionMode,
+    LiveEnablementStatus,
     PositionSide,
     PriceSource,
     PriceTick,
@@ -351,7 +352,43 @@ class DaemonServiceTest(unittest.TestCase):
             daemon.run_once()
 
             self.assertTrue(store.load().rule_states[rule.id].triggered)
+            self.assertEqual(store.load().rules[rule.id].live_status, LiveEnablementStatus.MANUAL_REVIEW)
             self.assertEqual(policy.calls, 1)
+
+    def test_canary_success_records_canary_succeeded_status(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = LocalStateStore(Path(temp_dir) / "state.json")
+            state = store.load()
+            rule = TrailingStopRule(
+                coin="ETH",
+                side=PositionSide.LONG,
+                size=Decimal("1"),
+                trail_mode=TrailMode.ABSOLUTE,
+                trail_value=Decimal("5"),
+                execution_mode=ExecutionMode.AUTO_SUBMIT,
+            )
+            runtime = state.ensure_rule_state(rule)
+            runtime.protected_size = Decimal("1")
+            runtime.favorable_price = Decimal("100")
+            runtime.stop_price = Decimal("95")
+            store.save(state)
+            policy = ReturningSubmissionPolicy(SubmissionOutcome.LIVE_SUBMITTED)
+            daemon = DaemonService(
+                store=store,
+                audit=JsonlAuditLog(Path(temp_dir) / "audit.jsonl"),
+                market_data=FakeMarketData({"ETH": [Decimal("94")]}),
+                account=FakeAccount(positions=[PositionSnapshot("ETH", PositionSide.LONG, Decimal("1"))]),
+                submission_policy=policy,
+            )
+
+            daemon.run_once()
+
+            loaded = store.load()
+            self.assertEqual(loaded.rules[rule.id].live_status, LiveEnablementStatus.CANARY_SUCCEEDED)
+            self.assertEqual(
+                loaded.rule_states[rule.id].rule.live_status,
+                LiveEnablementStatus.CANARY_SUCCEEDED,
+            )
 
     def test_presubmit_kill_switch_refresh_blocks_current_live_submission(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

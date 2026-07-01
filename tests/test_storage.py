@@ -8,6 +8,7 @@ from unittest.mock import patch
 
 from hl_advanced_orders.models import (
     ExecutionMode,
+    LiveEnablementStatus,
     PositionSide,
     TrailMode,
     TrailingStopRule,
@@ -39,6 +40,7 @@ class LocalStateStoreTest(unittest.TestCase):
             )
             runtime = state.ensure_rule_state(rule)
             runtime.protected_size = Decimal("0.4")
+            state.live_mark_observed_at_by_rule[rule.id] = "2026-06-30T10:00:00+00:00"
 
             store.save(state)
             loaded = store.load()
@@ -46,12 +48,40 @@ class LocalStateStoreTest(unittest.TestCase):
             loaded_rule = loaded.rules[rule.id]
             loaded_runtime = loaded.rule_states[rule.id]
             self.assertEqual(loaded_rule.execution_mode, ExecutionMode.DRY_RUN)
+            self.assertEqual(loaded_rule.live_status, LiveEnablementStatus.DRY_RUN)
             self.assertEqual(loaded_rule.coin, "ETH")
             self.assertEqual(loaded_rule.side, PositionSide.LONG)
             self.assertEqual(loaded_rule.size, Decimal("1.0"))
             self.assertEqual(loaded_rule.trail_mode, TrailMode.PERCENT)
             self.assertEqual(loaded_rule.trail_value, Decimal("7.5"))
             self.assertEqual(loaded_runtime.protected_size, Decimal("0.4"))
+            self.assertEqual(
+                loaded.live_mark_observed_at_by_rule[rule.id],
+                "2026-06-30T10:00:00+00:00",
+            )
+
+    def test_auto_submit_rule_defaults_to_canary_pending_and_round_trips(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = LocalStateStore(Path(temp_dir) / "state.json")
+            state = store.load()
+            rule = TrailingStopRule(
+                coin="ETH",
+                side=PositionSide.LONG,
+                size=Decimal("1"),
+                trail_mode=TrailMode.ABSOLUTE,
+                trail_value=Decimal("50"),
+                execution_mode=ExecutionMode.AUTO_SUBMIT,
+            )
+            state.ensure_rule_state(rule)
+
+            store.save(state)
+            loaded = store.load()
+
+            self.assertEqual(rule.live_status, LiveEnablementStatus.CANARY_PENDING)
+            self.assertEqual(
+                loaded.rules[rule.id].live_status,
+                LiveEnablementStatus.CANARY_PENDING,
+            )
 
     def test_malformed_json_raises_storage_error_without_deleting_file(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -75,6 +105,39 @@ class LocalStateStoreTest(unittest.TestCase):
             loaded = LocalStateStore(path).load()
 
             self.assertTrue(loaded.kill_switch_active)
+
+    def test_health_state_round_trips(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "state.json"
+            state = LocalStateStore(path).load()
+            state.health.mode = "running"
+            state.health.last_tick_started_at = "2026-06-30T10:00:00+00:00"
+            state.health.last_tick_completed_at = "2026-06-30T10:00:01+00:00"
+            state.health.last_successful_account_snapshot_at = "2026-06-30T10:00:01+00:00"
+            state.health.last_successful_market_snapshot_at = "2026-06-30T10:00:01+00:00"
+            state.health.consecutive_failures = 2
+            state.health.active_error = "market unavailable"
+            state.health.active_rules_count = 3
+            state.health.last_blocked_reasons = ["kill switch is active"]
+
+            LocalStateStore(path).save(state)
+            loaded = LocalStateStore(path).load()
+
+            self.assertEqual(loaded.health.mode, "running")
+            self.assertEqual(loaded.health.last_tick_started_at, "2026-06-30T10:00:00+00:00")
+            self.assertEqual(loaded.health.last_tick_completed_at, "2026-06-30T10:00:01+00:00")
+            self.assertEqual(
+                loaded.health.last_successful_account_snapshot_at,
+                "2026-06-30T10:00:01+00:00",
+            )
+            self.assertEqual(
+                loaded.health.last_successful_market_snapshot_at,
+                "2026-06-30T10:00:01+00:00",
+            )
+            self.assertEqual(loaded.health.consecutive_failures, 2)
+            self.assertEqual(loaded.health.active_error, "market unavailable")
+            self.assertEqual(loaded.health.active_rules_count, 3)
+            self.assertEqual(loaded.health.last_blocked_reasons, ["kill switch is active"])
 
     def test_failed_atomic_replace_leaves_previous_state_loadable(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

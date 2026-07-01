@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from enum import StrEnum
 from typing import Any, Protocol
 
 from .audit import AuditEvent, JsonlAuditLog
-from .models import ExecutionMode, TrailingStopRule, TriggeredExit
+from .models import ExecutionMode, LiveEnablementStatus, TrailingStopRule, TriggeredExit
 from .readiness import ReadinessChecker, ReadinessContext
 
 EXCHANGE_ERROR_STATUSES = frozenset({"error", "err", "rejected", "failed", "failure"})
@@ -30,10 +31,14 @@ class SubmissionPolicy:
         audit: JsonlAuditLog,
         exchange: ExchangeGateway | None = None,
         readiness_checker: ReadinessChecker | None = None,
+        canary_mode: bool = False,
+        max_mark_age: timedelta = timedelta(minutes=5),
     ) -> None:
         self.audit = audit
         self.exchange = exchange
         self.readiness_checker = readiness_checker
+        self.canary_mode = canary_mode
+        self.max_mark_age = max_mark_age
 
     def handle(
         self,
@@ -53,7 +58,7 @@ class SubmissionPolicy:
             )
             return SubmissionOutcome.DRY_RUN_RECORDED
 
-        reasons = self._blocked_reasons(rule, context)
+        reasons = self._blocked_reasons(triggered, rule, context)
         if reasons:
             self.audit.append(
                 AuditEvent.create(
@@ -72,7 +77,11 @@ class SubmissionPolicy:
                     "live_submission_attempted",
                     "Live submission attempted.",
                     rule_id=triggered.rule_id,
-                    payload=trigger_payload(triggered, outcome="attempted"),
+                    payload={
+                        **trigger_payload(triggered, outcome="attempted"),
+                        "live_status": rule.live_status.value,
+                        "canary_mode": self.canary_mode,
+                    },
                 )
             )
             response = self.exchange.submit_market_close(triggered.coin, triggered.size)
@@ -96,6 +105,8 @@ class SubmissionPolicy:
                     rule_id=triggered.rule_id,
                     payload={
                         **trigger_payload(triggered, outcome="rejected"),
+                        "live_status": rule.live_status.value,
+                        "canary_mode": self.canary_mode,
                         "error": response_error,
                         "exchange_response": response,
                     },
@@ -110,6 +121,8 @@ class SubmissionPolicy:
                 rule_id=triggered.rule_id,
                 payload={
                     **trigger_payload(triggered, outcome="submitted"),
+                    "live_status": rule.live_status.value,
+                    "canary_mode": self.canary_mode,
                     "exchange_response": response,
                 },
             )
@@ -118,6 +131,7 @@ class SubmissionPolicy:
 
     def _blocked_reasons(
         self,
+        triggered: TriggeredExit,
         rule: TrailingStopRule,
         context: ReadinessContext | None,
     ) -> list[str]:
@@ -135,7 +149,27 @@ class SubmissionPolicy:
             for reason in result.reasons:
                 if reason not in reasons:
                     reasons.append(reason)
+        if self._mark_is_stale(rule, triggered):
+            reasons.append("mark price observation is stale")
+        if rule.live_status == LiveEnablementStatus.CANARY_PENDING and not self.canary_mode:
+            reasons.append("canary evidence is required before normal live auto_submit")
+        elif rule.live_status == LiveEnablementStatus.MANUAL_REVIEW:
+            reasons.append("rule requires manual review")
+        elif rule.live_status == LiveEnablementStatus.DRY_RUN:
+            reasons.append("rule is not live-enabled")
         return reasons
+
+    def _mark_is_stale(
+        self,
+        rule: TrailingStopRule,
+        triggered: TriggeredExit,
+    ) -> bool:
+        if rule.execution_mode != ExecutionMode.AUTO_SUBMIT:
+            return False
+        observed_at = triggered.mark_observed_at
+        if observed_at.tzinfo is None:
+            observed_at = observed_at.replace(tzinfo=timezone.utc)
+        return datetime.now(timezone.utc) - observed_at > self.max_mark_age
 
 
 def trigger_payload(triggered: TriggeredExit, *, outcome: str) -> dict[str, Any]:
@@ -162,7 +196,9 @@ def exchange_response_error(response: dict[str, Any]) -> str | None:
     if nested_error is not None:
         return nested_error
 
-    if status and status != "ok":
+    if not status:
+        return "missing exchange status"
+    if status != "ok":
         return f"unexpected exchange status: {status}"
     return None
 
