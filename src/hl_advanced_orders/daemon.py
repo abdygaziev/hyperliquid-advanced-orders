@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import replace
 from decimal import Decimal
+from time import sleep
 from typing import Protocol
 
 from .audit import AuditEvent, JsonlAuditLog
@@ -28,6 +29,77 @@ class AccountGateway(Protocol):
 
 
 ReadinessContextFactory = Callable[[LocalDaemonState, TrailingStopRule], ReadinessContext | None]
+SleepFn = Callable[[float], None]
+StopPredicate = Callable[[], bool]
+
+
+class RunnableDaemon(Protocol):
+    def run_once(self) -> None:
+        pass
+
+
+class DaemonRunner:
+    def __init__(
+        self,
+        *,
+        daemon: RunnableDaemon,
+        audit: JsonlAuditLog,
+        interval_seconds: float,
+        max_ticks: int | None = None,
+        sleep_fn: SleepFn = sleep,
+        should_stop: StopPredicate | None = None,
+        continue_on_error: bool = True,
+    ) -> None:
+        if interval_seconds <= 0:
+            raise ValueError("interval_seconds must be positive")
+        if max_ticks is not None and max_ticks <= 0:
+            raise ValueError("max_ticks must be positive")
+        self.daemon = daemon
+        self.audit = audit
+        self.interval_seconds = interval_seconds
+        self.max_ticks = max_ticks
+        self.sleep_fn = sleep_fn
+        self.should_stop = should_stop or (lambda: False)
+        self.continue_on_error = continue_on_error
+
+    def run(self) -> int:
+        ticks = 0
+        stop_reason = "stop_requested"
+        while not self.should_stop():
+            if self.max_ticks is not None and ticks >= self.max_ticks:
+                stop_reason = "max_ticks_reached"
+                break
+            try:
+                self.daemon.run_once()
+            except Exception as exc:
+                self.audit.append(
+                    AuditEvent.create(
+                        "daemon_tick_failed",
+                        "Daemon tick failed.",
+                        payload={"error": str(exc)},
+                    )
+                )
+                if not self.continue_on_error:
+                    raise
+            ticks += 1
+            if self.max_ticks is not None and ticks >= self.max_ticks:
+                stop_reason = "max_ticks_reached"
+                break
+            if self.should_stop():
+                stop_reason = "stop_requested"
+                break
+            self.sleep_fn(self.interval_seconds)
+        else:
+            stop_reason = "stop_requested"
+
+        self.audit.append(
+            AuditEvent.create(
+                "daemon_stopped",
+                "Daemon stopped.",
+                payload={"reason": stop_reason, "ticks": ticks},
+            )
+        )
+        return ticks
 
 
 class DaemonService:

@@ -32,6 +32,9 @@ class FakeInfo:
     def all_mids(self) -> dict[str, str]:
         return self.mids
 
+    def meta(self, dex: str = "") -> dict[str, object]:
+        return {"universe": [{"name": "ETH"}, {"name": "BTC"}]}
+
     def user_state(self, address: str) -> dict[str, object]:
         self.address = address
         return self.user_state_payload
@@ -75,6 +78,12 @@ class HyperliquidGatewayTest(unittest.TestCase):
         self.assertEqual(tick.coin, "ETH")
         self.assertEqual(tick.mark_price, Decimal("2450.125"))
         self.assertEqual(tick.source, PriceSource.MID)
+
+    def test_market_exists_uses_metadata_universe(self) -> None:
+        gateway = HyperliquidMarketDataGateway(info=FakeInfo())
+
+        self.assertTrue(gateway.market_exists("eth"))
+        self.assertFalse(gateway.market_exists("SOL"))
 
     def test_user_positions_map_positive_long_negative_short_and_skip_zero(self) -> None:
         gateway = HyperliquidAccountGateway(info=FakeInfo(), address="0xabc")

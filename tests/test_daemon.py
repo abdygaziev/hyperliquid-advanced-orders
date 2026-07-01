@@ -7,7 +7,7 @@ from decimal import Decimal
 from pathlib import Path
 
 from hl_advanced_orders.audit import JsonlAuditLog
-from hl_advanced_orders.daemon import DaemonService
+from hl_advanced_orders.daemon import DaemonRunner, DaemonService
 from hl_advanced_orders.hyperliquid_client import FillEvent, PositionSnapshot
 from hl_advanced_orders.models import (
     ExecutionMode,
@@ -76,10 +76,85 @@ class ReturningSubmissionPolicy:
         return self.outcome
 
 
+class CountingDaemon:
+    def __init__(self, *, fail_on: set[int] | None = None) -> None:
+        self.calls = 0
+        self.fail_on = fail_on or set()
+
+    def run_once(self) -> None:
+        self.calls += 1
+        if self.calls in self.fail_on:
+            raise RuntimeError(f"tick {self.calls} failed")
+
+
 class KillSwitchActivatingStore(LocalStateStore):
     def save_preserving_active_kill_switch(self, state):
         state.kill_switch_active = True
         super().save_preserving_active_kill_switch(state)
+
+
+class DaemonRunnerTest(unittest.TestCase):
+    def test_runner_stops_after_max_ticks_and_sleeps_between_ticks(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            daemon = CountingDaemon()
+            sleeps: list[float] = []
+            runner = DaemonRunner(
+                daemon=daemon,
+                audit=JsonlAuditLog(Path(temp_dir) / "audit.jsonl"),
+                interval_seconds=0.25,
+                max_ticks=3,
+                sleep_fn=sleeps.append,
+            )
+
+            ticks = runner.run()
+
+            events = read_events(Path(temp_dir) / "audit.jsonl")
+            self.assertEqual(ticks, 3)
+            self.assertEqual(daemon.calls, 3)
+            self.assertEqual(sleeps, [0.25, 0.25])
+            self.assertEqual(events[-1]["event_type"], "daemon_stopped")
+            self.assertEqual(events[-1]["payload"]["reason"], "max_ticks_reached")
+
+    def test_runner_stop_signal_records_graceful_stop(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            daemon = CountingDaemon()
+
+            def should_stop() -> bool:
+                return daemon.calls >= 2
+
+            runner = DaemonRunner(
+                daemon=daemon,
+                audit=JsonlAuditLog(Path(temp_dir) / "audit.jsonl"),
+                interval_seconds=1,
+                sleep_fn=lambda _: None,
+                should_stop=should_stop,
+            )
+
+            ticks = runner.run()
+
+            events = read_events(Path(temp_dir) / "audit.jsonl")
+            self.assertEqual(ticks, 2)
+            self.assertEqual(events[-1]["payload"]["reason"], "stop_requested")
+
+    def test_runner_audits_recoverable_tick_failure_and_continues(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            daemon = CountingDaemon(fail_on={2})
+            audit_path = Path(temp_dir) / "audit.jsonl"
+            runner = DaemonRunner(
+                daemon=daemon,
+                audit=JsonlAuditLog(audit_path),
+                interval_seconds=1,
+                max_ticks=3,
+                sleep_fn=lambda _: None,
+            )
+
+            runner.run()
+
+            events = read_events(audit_path)
+            self.assertEqual(daemon.calls, 3)
+            self.assertEqual(events[0]["event_type"], "daemon_tick_failed")
+            self.assertIn("tick 2 failed", events[0]["payload"]["error"])
+            self.assertEqual(events[-1]["event_type"], "daemon_stopped")
 
 
 class DaemonServiceTest(unittest.TestCase):

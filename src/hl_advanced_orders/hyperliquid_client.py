@@ -29,6 +29,9 @@ class FillEvent:
 
 
 class InfoClient(Protocol):
+    def meta(self, dex: str = "") -> dict[str, Any]:
+        pass
+
     def all_mids(self) -> dict[str, Any]:
         pass
 
@@ -59,11 +62,24 @@ class HyperliquidMarketDataGateway:
             raise ValueError(f"missing mark price for {normalized_coin}")
         return PriceTick.now(normalized_coin, Decimal(str(mids[normalized_coin])), source=PriceSource.MID)
 
+    def market_exists(self, coin: str) -> bool:
+        normalized_coin = coin.upper()
+        meta = self._metadata()
+        universe = meta.get("universe", [])
+        return any(str(asset.get("name", "")).upper() == normalized_coin for asset in universe)
+
+    def _metadata(self) -> dict[str, Any]:
+        try:
+            return self.info.meta()
+        except AttributeError:
+            payload = self._meta_and_asset_contexts_payload()
+            meta, _ = self._split_meta_and_contexts(payload)
+            return meta
+
     def _mark_price_from_asset_context(self, coin: str) -> Decimal | None:
-        meta_and_contexts = getattr(self.info, "meta_and_asset_ctxs", None)
-        if meta_and_contexts is None:
+        payload = self._meta_and_asset_contexts_payload()
+        if payload is None:
             return None
-        payload = meta_and_contexts()
         meta, contexts = self._split_meta_and_contexts(payload)
         universe = meta.get("universe", [])
         for index, asset in enumerate(universe):
@@ -74,6 +90,12 @@ class HyperliquidMarketDataGateway:
             raw_mark = contexts[index].get("markPx")
             return Decimal(str(raw_mark)) if raw_mark is not None else None
         return None
+
+    def _meta_and_asset_contexts_payload(self) -> Any:
+        meta_and_contexts = getattr(self.info, "meta_and_asset_ctxs", None)
+        if meta_and_contexts is None:
+            return None
+        return meta_and_contexts()
 
     def _split_meta_and_contexts(self, payload: Any) -> tuple[dict[str, Any], list[dict[str, Any]]]:
         if isinstance(payload, tuple | list) and len(payload) >= 2:

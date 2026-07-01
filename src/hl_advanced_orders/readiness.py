@@ -24,6 +24,8 @@ class ReadinessContext:
     kill_switch_active: bool
     dry_run_events_count: int
     confirmation_phrase: str
+    market_verification: str = "unknown"
+    market_verification_error: str | None = None
 
 
 class ReadinessChecker:
@@ -38,7 +40,12 @@ class ReadinessChecker:
         reasons: list[str] = []
         if not self.secrets.has_private_key(context.account):
             reasons.append("missing private key in macOS Keychain")
-        if not context.market_exists:
+        if context.market_verification_error:
+            reasons.append(
+                f"market verification unavailable for {rule.coin}: "
+                f"{context.market_verification_error}"
+            )
+        elif not context.market_exists:
             reasons.append(f"market does not exist: {rule.coin}")
         if not context.observed_live_mark_price:
             reasons.append("rule has not observed live mark prices")
