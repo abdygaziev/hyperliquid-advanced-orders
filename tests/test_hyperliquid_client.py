@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import unittest
 from decimal import Decimal
+from unittest.mock import patch
 
 from hl_advanced_orders.hyperliquid_client import (
+    DEFAULT_SDK_TIMEOUT_SECONDS,
     FillEvent,
     HyperliquidAccountGateway,
     HyperliquidExchangeGateway,
@@ -132,6 +134,38 @@ class HyperliquidGatewayTest(unittest.TestCase):
                 wallet_address="0xabc",
                 secrets=secrets,
             )
+
+    def test_market_data_gateway_sets_sdk_timeout(self) -> None:
+        with patch("hyperliquid.info.Info") as info_class:
+            HyperliquidMarketDataGateway(base_url="https://example.test", timeout=3.5)
+
+        info_class.assert_called_once_with(
+            base_url="https://example.test",
+            skip_ws=True,
+            timeout=3.5,
+        )
+
+    def test_exchange_gateway_sets_default_sdk_timeout(self) -> None:
+        secrets = InMemorySecrets()
+        secrets.set_private_key("trader", "0xabc")
+        wallet = object()
+
+        with (
+            patch("eth_account.Account.from_key", return_value=wallet) as from_key,
+            patch("hyperliquid.exchange.Exchange") as exchange_class,
+        ):
+            HyperliquidExchangeGateway.from_keychain(
+                account="trader",
+                wallet_address="0xwallet",
+                secrets=secrets,
+            )
+
+        from_key.assert_called_once_with("0xabc")
+        exchange_class.assert_called_once_with(
+            wallet,
+            account_address="0xwallet",
+            timeout=DEFAULT_SDK_TIMEOUT_SECONDS,
+        )
 
     def test_live_exit_uses_reduce_only_market_close_with_protected_size(self) -> None:
         exchange = FakeExchange()
