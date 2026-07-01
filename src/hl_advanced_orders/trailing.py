@@ -52,7 +52,7 @@ class TrailingStopEngine:
 
         if self._is_triggered(state.rule.side, tick.mark_price, state.stop_price):
             state.triggered = True
-            return self._exit_for(state, tick.mark_price)
+            return self._exit_for(state, tick)
         return None
 
     def _signal_price(self, state: TrailingStopState, mark_price: Decimal) -> Decimal | None:
@@ -95,7 +95,7 @@ class TrailingStopEngine:
             return mark_price <= stop_price
         return mark_price >= stop_price
 
-    def _exit_for(self, state: TrailingStopState, mark_price: Decimal) -> TriggeredExit:
+    def _exit_for(self, state: TrailingStopState, tick: PriceTick) -> TriggeredExit:
         close_side = "sell" if state.rule.side == PositionSide.LONG else "buy"
         assert state.stop_price is not None
         return TriggeredExit(
@@ -104,8 +104,9 @@ class TrailingStopEngine:
             side=close_side,
             size=state.protected_size,
             reason="trailing_stop_triggered",
-            mark_price=mark_price,
+            mark_price=tick.mark_price,
             stop_price=state.stop_price,
             execution_mode=state.rule.execution_mode or ExecutionMode.DRY_RUN,
             exit_order_type=state.rule.exit_order_type,
+            mark_observed_at=tick.observed_at,
         )

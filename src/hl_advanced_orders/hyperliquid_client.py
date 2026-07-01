@@ -13,6 +13,13 @@ class MissingPrivateKeyError(RuntimeError):
 
 
 @dataclass(frozen=True)
+class MarketMetadata:
+    coin: str
+    exists: bool
+    source: str
+
+
+@dataclass(frozen=True)
 class PositionSnapshot:
     coin: str
     side: PositionSide
@@ -29,6 +36,9 @@ class FillEvent:
 
 
 class InfoClient(Protocol):
+    def meta_and_asset_ctxs(self) -> Any:
+        pass
+
     def all_mids(self) -> dict[str, Any]:
         pass
 
@@ -41,6 +51,9 @@ class InfoClient(Protocol):
 
 class ExchangeClient(Protocol):
     def market_close(self, coin: str, sz: Decimal) -> dict[str, Any]:
+        pass
+
+    def schedule_cancel(self, time: int | None) -> dict[str, Any]:
         pass
 
 
@@ -58,6 +71,17 @@ class HyperliquidMarketDataGateway:
         if normalized_coin not in mids:
             raise ValueError(f"missing mark price for {normalized_coin}")
         return PriceTick.now(normalized_coin, Decimal(str(mids[normalized_coin])), source=PriceSource.MID)
+
+    def get_market_metadata(self, coin: str) -> MarketMetadata:
+        normalized_coin = coin.upper()
+        meta_and_contexts = getattr(self.info, "meta_and_asset_ctxs", None)
+        if meta_and_contexts is None:
+            return MarketMetadata(coin=normalized_coin, exists=False, source="unavailable")
+        payload = meta_and_contexts()
+        meta, _contexts = self._split_meta_and_contexts(payload)
+        universe = meta.get("universe", [])
+        exists = any(str(asset.get("name", "")).upper() == normalized_coin for asset in universe)
+        return MarketMetadata(coin=normalized_coin, exists=exists, source="meta_and_asset_ctxs")
 
     def _mark_price_from_asset_context(self, coin: str) -> Decimal | None:
         meta_and_contexts = getattr(self.info, "meta_and_asset_ctxs", None)
@@ -158,6 +182,9 @@ class HyperliquidExchangeGateway:
 
     def submit_market_close(self, coin: str, size: Decimal) -> dict[str, Any]:
         return self.exchange.market_close(coin.upper(), size)
+
+    def schedule_cancel(self, time_ms: int | None) -> dict[str, Any]:
+        return self.exchange.schedule_cancel(time_ms)
 
     @staticmethod
     def _build_exchange(

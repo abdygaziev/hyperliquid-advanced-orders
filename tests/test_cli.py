@@ -11,8 +11,8 @@ from typer.testing import CliRunner
 
 from hl_advanced_orders.audit import AuditEvent, JsonlAuditLog
 from hl_advanced_orders.cli import app
-from hl_advanced_orders.hyperliquid_client import PositionSnapshot
-from hl_advanced_orders.models import PositionSide, PriceTick
+from hl_advanced_orders.hyperliquid_client import MarketMetadata, PositionSnapshot
+from hl_advanced_orders.models import LiveEnablementStatus, PositionSide, PriceTick
 from hl_advanced_orders.storage import LocalStateStore
 
 
@@ -56,6 +56,7 @@ class CliWorkflowTest(unittest.TestCase):
         state = json.loads((self.data_dir / "state.json").read_text(encoding="utf-8"))
         events = read_events(self.data_dir / "audit.jsonl")
         self.assertEqual(state["rules"][0]["execution_mode"], "dry_run")
+        self.assertEqual(state["rules"][0]["live_status"], "dry_run")
         self.assertEqual(state["rules"][0]["id"], rule_id)
         self.assertEqual(events[-1]["event_type"], "rule_created")
 
@@ -89,6 +90,7 @@ class CliWorkflowTest(unittest.TestCase):
         self.assertIn("ETH", result.output)
         self.assertIn("long", result.output)
         self.assertIn("dry_run", result.output)
+        self.assertIn("live_status=dry_run", result.output)
         self.assertIn("protected=0", result.output)
         self.assertIn("active", result.output)
 
@@ -210,6 +212,94 @@ class CliWorkflowTest(unittest.TestCase):
             ["market:http://example", "account:0xabc:True", "daemon:init", "daemon:run_once"],
         )
 
+    def test_run_continuous_uses_runner_and_max_iterations(self) -> None:
+        calls: list[str] = []
+
+        class FakeMarketData:
+            info = object()
+
+            def __init__(self, base_url: str | None = None) -> None:
+                calls.append(f"market:{base_url}")
+
+        class FakeAccountGateway:
+            def __init__(self, info: object, address: str) -> None:
+                calls.append(f"account:{address}:{info is FakeMarketData.info}")
+
+        class FakeDaemon:
+            def __init__(self, **kwargs: object) -> None:
+                calls.append("daemon:init")
+
+        class FakeRunner:
+            def __init__(self, **kwargs: object) -> None:
+                calls.append(f"runner:interval={kwargs['poll_interval_seconds']}")
+                calls.append(f"runner:max={kwargs['max_iterations']}")
+
+            def run(self) -> int:
+                calls.append("runner:run")
+                return 2
+
+        with (
+            patch("hl_advanced_orders.cli.HyperliquidMarketDataGateway", FakeMarketData),
+            patch("hl_advanced_orders.cli.HyperliquidAccountGateway", FakeAccountGateway),
+            patch("hl_advanced_orders.cli.DaemonService", FakeDaemon),
+            patch("hl_advanced_orders.cli.DaemonRunner", FakeRunner),
+        ):
+            result = self.invoke(
+                [
+                    "run",
+                    "--account-address",
+                    "0xabc",
+                    "--poll-interval-seconds",
+                    "0.5",
+                    "--max-iterations",
+                    "2",
+                ]
+            )
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertIn("Daemon stopped after 2 ticks.", result.output)
+        self.assertEqual(
+            calls,
+            [
+                "market:None",
+                "account:0xabc:True",
+                "daemon:init",
+                "runner:interval=0.5",
+                "runner:max=2",
+                "runner:run",
+            ],
+        )
+
+    def test_run_continuous_rejects_non_positive_poll_interval(self) -> None:
+        result = self.invoke(["run", "--account-address", "0xabc", "--poll-interval-seconds", "0"])
+
+        self.assertNotEqual(result.exit_code, 0)
+        self.assertIn("--poll-interval-seconds must be positive", result.output)
+
+    def test_health_command_prints_persisted_health_state(self) -> None:
+        store = LocalStateStore(self.data_dir / "state.json")
+        state = store.load()
+        state.health.mode = "running"
+        state.health.active_rules_count = 2
+        state.health.last_tick_started_at = "2026-06-30T10:00:00+00:00"
+        state.health.last_tick_completed_at = "2026-06-30T10:00:01+00:00"
+        state.health.last_successful_account_snapshot_at = "2026-06-30T10:00:01+00:00"
+        state.health.last_successful_market_snapshot_at = "2026-06-30T10:00:01+00:00"
+        state.health.consecutive_failures = 1
+        state.health.active_error = "market unavailable"
+        state.health.last_blocked_reasons = ["kill switch is active"]
+        store.save(state)
+
+        result = self.invoke(["health"])
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertIn("mode=running", result.output)
+        self.assertIn("active_rules=2", result.output)
+        self.assertIn("last_tick_started_at=2026-06-30T10:00:00+00:00", result.output)
+        self.assertIn("consecutive_failures=1", result.output)
+        self.assertIn("active_error=market unavailable", result.output)
+        self.assertIn("last_blocked_reasons=kill switch is active", result.output)
+
     def test_run_once_rejects_auto_submit_without_live_options(self) -> None:
         self.create_auto_submit_rule()
 
@@ -219,6 +309,7 @@ class CliWorkflowTest(unittest.TestCase):
         self.assertIn("auto_submit rules require", result.output)
         self.assertIn("--keychain-account", result.output)
         self.assertIn("--wallet-address", result.output)
+        self.assertNotIn("--market-exists", result.output)
 
     def test_run_once_wires_live_submission_for_auto_submit_rules(self) -> None:
         self.create_auto_submit_rule()
@@ -229,6 +320,9 @@ class CliWorkflowTest(unittest.TestCase):
 
             def __init__(self, base_url: str | None = None) -> None:
                 calls.append(f"market:{base_url}")
+
+            def get_market_metadata(self, coin: str):
+                return MarketMetadata(coin=coin.upper(), exists=True, source="fake")
 
         class FakeAccountGateway:
             def __init__(self, info: object, address: str) -> None:
@@ -268,13 +362,14 @@ class CliWorkflowTest(unittest.TestCase):
                     "0xwallet",
                     "--confirmation-phrase",
                     "enable mainnet auto submit",
-                    "--market-exists",
+                    "--canary",
                     "--base-url",
                     "http://example",
                 ]
             )
 
         self.assertEqual(result.exit_code, 0, result.output)
+        self.assertIn("Canary mode target=http://example", result.output)
         self.assertEqual(
             calls,
             [
@@ -285,6 +380,173 @@ class CliWorkflowTest(unittest.TestCase):
                 "daemon:run_once",
             ],
         )
+
+    def test_promote_live_requires_canary_succeeded_status(self) -> None:
+        rule_id = self.create_auto_submit_rule()
+
+        blocked = self.invoke(["rule", "promote-live", rule_id])
+
+        self.assertNotEqual(blocked.exit_code, 0)
+        self.assertIn("canary_succeeded", blocked.output)
+
+        store = LocalStateStore(self.data_dir / "state.json")
+        state = store.load()
+        rule = state.rules[rule_id]
+        promoted_candidate = rule.__class__(
+            id=rule.id,
+            coin=rule.coin,
+            side=rule.side,
+            size=rule.size,
+            trail_mode=rule.trail_mode,
+            trail_value=rule.trail_value,
+            exit_order_type=rule.exit_order_type,
+            execution_mode=rule.execution_mode,
+            status=rule.status,
+            live_status=LiveEnablementStatus.CANARY_SUCCEEDED,
+            attached_order_id=rule.attached_order_id,
+        )
+        state.rules[rule_id] = promoted_candidate
+        state.rule_states[rule_id].rule = promoted_candidate
+        store.save(state)
+
+        result = self.invoke(["rule", "promote-live", rule_id])
+        loaded = store.load()
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertIn("normal_live", result.output)
+        self.assertEqual(loaded.rules[rule_id].live_status, LiveEnablementStatus.NORMAL_LIVE)
+
+    def test_manual_review_listing_and_diagnostics_are_redacted(self) -> None:
+        rule_id = self.create_auto_submit_rule()
+        store = LocalStateStore(self.data_dir / "state.json")
+        state = store.load()
+        rule = state.rules[rule_id]
+        updated = rule.__class__(
+            id=rule.id,
+            coin=rule.coin,
+            side=rule.side,
+            size=rule.size,
+            trail_mode=rule.trail_mode,
+            trail_value=rule.trail_value,
+            exit_order_type=rule.exit_order_type,
+            execution_mode=rule.execution_mode,
+            status=rule.status,
+            live_status=LiveEnablementStatus.MANUAL_REVIEW,
+            attached_order_id=rule.attached_order_id,
+        )
+        state.rules[rule_id] = updated
+        state.rule_states[rule_id].rule = updated
+        store.save(state)
+        JsonlAuditLog(self.data_dir / "audit.jsonl").append(
+            AuditEvent.create("debug", "Debug.", payload={"private_key": "super-secret"})
+        )
+
+        review_result = self.invoke(["rule", "manual-review"])
+        diagnostics_result = self.invoke(["diagnostics"])
+
+        self.assertEqual(review_result.exit_code, 0, review_result.output)
+        self.assertIn(rule_id, review_result.output)
+        self.assertEqual(diagnostics_result.exit_code, 0, diagnostics_result.output)
+        self.assertIn("[REDACTED]", diagnostics_result.output)
+        self.assertNotIn("super-secret", diagnostics_result.output)
+
+    def test_state_validate_reports_malformed_state(self) -> None:
+        (self.data_dir / "state.json").write_text("{not-json", encoding="utf-8")
+
+        result = self.invoke(["state-validate"])
+
+        self.assertEqual(result.exit_code, 1)
+        self.assertIn("failed to load local state", result.output)
+
+    def test_reset_triggered_rule_uses_account_reconciliation(self) -> None:
+        rule_id = self.create_auto_submit_rule()
+        store = LocalStateStore(self.data_dir / "state.json")
+        state = store.load()
+        rule = state.rules[rule_id]
+        updated = rule.__class__(
+            id=rule.id,
+            coin=rule.coin,
+            side=rule.side,
+            size=rule.size,
+            trail_mode=rule.trail_mode,
+            trail_value=rule.trail_value,
+            exit_order_type=rule.exit_order_type,
+            execution_mode=rule.execution_mode,
+            status=rule.status,
+            live_status=LiveEnablementStatus.MANUAL_REVIEW,
+            attached_order_id=rule.attached_order_id,
+        )
+        state.rules[rule_id] = updated
+        state.rule_states[rule_id].rule = updated
+        state.rule_states[rule_id].triggered = True
+        store.save(state)
+
+        class FakeMarketData:
+            info = object()
+
+            def __init__(self, base_url: str | None = None) -> None:
+                pass
+
+        class FakeAccountGateway:
+            def __init__(self, info: object, address: str) -> None:
+                pass
+
+            def get_positions(self):
+                return [PositionSnapshot("ETH", PositionSide.LONG, Decimal("0.5"))]
+
+        with (
+            patch("hl_advanced_orders.cli.HyperliquidMarketDataGateway", FakeMarketData),
+            patch("hl_advanced_orders.cli.HyperliquidAccountGateway", FakeAccountGateway),
+        ):
+            result = self.invoke(
+                [
+                    "rule",
+                    "reset-triggered",
+                    rule_id,
+                    "--reason",
+                    "operator reviewed exchange fill",
+                    "--account-address",
+                    "0xabc",
+                ]
+            )
+
+        loaded = store.load()
+        events = read_events(self.data_dir / "audit.jsonl")
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertFalse(loaded.rule_states[rule_id].triggered)
+        self.assertEqual(loaded.rules[rule_id].live_status, LiveEnablementStatus.CANARY_PENDING)
+        self.assertEqual(events[-1]["event_type"], "rule_trigger_reset")
+
+    def test_emergency_cancel_invokes_gateway_and_audits(self) -> None:
+        calls: list[int | None] = []
+
+        class FakeExchangeGateway:
+            @classmethod
+            def from_keychain(cls, **kwargs: object):
+                return cls()
+
+            def schedule_cancel(self, time_ms: int | None):
+                calls.append(time_ms)
+                return {"status": "ok", "time": time_ms}
+
+        with patch("hl_advanced_orders.cli.HyperliquidExchangeGateway", FakeExchangeGateway):
+            result = self.invoke(
+                [
+                    "emergency-cancel",
+                    "--keychain-account",
+                    "trader",
+                    "--wallet-address",
+                    "0xwallet",
+                    "--time-ms",
+                    "123456",
+                ]
+            )
+
+        events = read_events(self.data_dir / "audit.jsonl")
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertEqual(calls, [123456])
+        self.assertEqual(events[-1]["event_type"], "emergency_cancel_scheduled")
+        self.assertEqual(events[-1]["payload"]["time_ms"], 123456)
 
     def test_run_once_missing_key_is_blocked_without_constructing_exchange(self) -> None:
         rule_id = self.create_auto_submit_rule()
@@ -314,6 +576,9 @@ class CliWorkflowTest(unittest.TestCase):
 
             def get_mark_price(self, coin: str):
                 return PriceTick.now(coin.upper(), Decimal("49"))
+
+            def get_market_metadata(self, coin: str):
+                return MarketMetadata(coin=coin.upper(), exists=True, source="fake")
 
         class FakeAccountGateway:
             def __init__(self, info: object, address: str) -> None:
@@ -354,6 +619,34 @@ class CliWorkflowTest(unittest.TestCase):
         self.assertEqual(result.exit_code, 0, result.output)
         self.assertEqual(events[-1]["event_type"], "live_submission_blocked")
         self.assertIn("missing private key in macOS Keychain", events[-1]["payload"]["reasons"])
+
+    def test_preflight_prints_all_failing_reasons_for_active_rules(self) -> None:
+        rule_id = self.create_auto_submit_rule()
+
+        class FakeMarketData:
+            def __init__(self, base_url: str | None = None) -> None:
+                pass
+
+            def get_market_metadata(self, coin: str):
+                return MarketMetadata(coin=coin.upper(), exists=False, source="fake_metadata")
+
+        class FakeSecrets:
+            def has_private_key(self, account: str) -> bool:
+                return False
+
+        with (
+            patch("hl_advanced_orders.cli.HyperliquidMarketDataGateway", FakeMarketData),
+            patch("hl_advanced_orders.cli.KeychainSecrets", FakeSecrets),
+        ):
+            result = self.invoke(["preflight", "--account", "trader"])
+
+        self.assertEqual(result.exit_code, 1)
+        self.assertIn(f"{rule_id} ETH blocked market_source=fake_metadata", result.output)
+        self.assertIn("missing private key in macOS Keychain", result.output)
+        self.assertIn("market does not exist: ETH", result.output)
+        self.assertIn("rule has not observed live mark prices", result.output)
+        self.assertIn("rule has not produced a dry-run audit event", result.output)
+        self.assertIn("confirmation phrase did not match", result.output)
 
     def create_auto_submit_rule(self) -> str:
         result = self.invoke(
