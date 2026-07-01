@@ -7,6 +7,8 @@ from typing import Any, Protocol
 from .models import PositionSide, PriceSource, PriceTick
 from .secrets import SecretStore
 
+DEFAULT_SDK_TIMEOUT_SECONDS = 10.0
+
 
 class MissingPrivateKeyError(RuntimeError):
     pass
@@ -58,8 +60,14 @@ class ExchangeClient(Protocol):
 
 
 class HyperliquidMarketDataGateway:
-    def __init__(self, info: InfoClient | None = None, *, base_url: str | None = None) -> None:
-        self.info = info if info is not None else self._default_info(base_url)
+    def __init__(
+        self,
+        info: InfoClient | None = None,
+        *,
+        base_url: str | None = None,
+        timeout: float = DEFAULT_SDK_TIMEOUT_SECONDS,
+    ) -> None:
+        self.info = info if info is not None else self._default_info(base_url, timeout)
 
     def get_mark_price(self, coin: str) -> PriceTick:
         normalized_coin = coin.upper()
@@ -110,12 +118,15 @@ class HyperliquidMarketDataGateway:
             return meta if isinstance(meta, dict) else {}, contexts if isinstance(contexts, list) else []
         return {}, []
 
-    def _default_info(self, base_url: str | None) -> InfoClient:
+    def _default_info(self, base_url: str | None, timeout: float) -> InfoClient:
         try:
             from hyperliquid.info import Info
         except ImportError as exc:
             raise RuntimeError("hyperliquid-python-sdk is required for live market data") from exc
-        return Info(base_url=base_url, skip_ws=True) if base_url else Info(skip_ws=True)
+        kwargs: dict[str, Any] = {"skip_ws": True, "timeout": timeout}
+        if base_url is not None:
+            kwargs["base_url"] = base_url
+        return Info(**kwargs)
 
 
 class HyperliquidAccountGateway:
@@ -173,11 +184,12 @@ class HyperliquidExchangeGateway:
         wallet_address: str,
         secrets: SecretStore,
         base_url: str | None = None,
+        timeout: float = DEFAULT_SDK_TIMEOUT_SECONDS,
     ) -> "HyperliquidExchangeGateway":
         private_key = secrets.get_private_key(account)
         if private_key is None:
             raise MissingPrivateKeyError(f"missing private key for account: {account}")
-        exchange = cls._build_exchange(private_key, wallet_address, base_url)
+        exchange = cls._build_exchange(private_key, wallet_address, base_url, timeout)
         return cls(exchange=exchange)
 
     def submit_market_close(self, coin: str, size: Decimal) -> dict[str, Any]:
@@ -191,6 +203,7 @@ class HyperliquidExchangeGateway:
         private_key: str,
         wallet_address: str,
         base_url: str | None,
+        timeout: float,
     ) -> ExchangeClient:
         try:
             from eth_account import Account
@@ -204,4 +217,5 @@ class HyperliquidExchangeGateway:
         kwargs: dict[str, Any] = {"account_address": wallet_address}
         if base_url is not None:
             kwargs["base_url"] = base_url
+        kwargs["timeout"] = timeout
         return Exchange(wallet, **kwargs)
